@@ -315,7 +315,24 @@ function render(s) {
   $('conn').className = on ? 'ok' : 'bad';
   $('meta').textContent = s.loggedInAt ? '登录时间：' + new Date(s.loggedInAt).toLocaleString() + (s.baseUrl ? ' · ' + s.baseUrl : '') : (s.lastError ? '最近错误：' + s.lastError : '未登录');
   const rows = Object.entries(s.sessionMap || {});
-  $('sessions').innerHTML = '<tr><th>微信用户</th><th>会话</th></tr>' + (rows.length ? rows.map(([u, sid]) => '<tr><td>' + u.slice(0, 18) + '…</td><td>' + sid + '</td></tr>').join('') : '<tr><td colspan="2" class="muted">（暂无映射）</td></tr>');
+  const tbl = $('sessions');
+  tbl.replaceChildren();
+  {
+    const tr = tbl.insertRow(), th1 = document.createElement('th'), th2 = document.createElement('th');
+    th1.textContent = '微信用户'; th2.textContent = '会话';
+    tr.append(th1, th2);
+  }
+  if (rows.length) {
+    for (const [u, sid] of rows) {
+      const tr = tbl.insertRow(), td1 = document.createElement('td'), td2 = document.createElement('td');
+      td1.textContent = u.slice(0, 18) + '…'; td2.textContent = sid;
+      tr.append(td1, td2);
+    }
+  } else {
+    const tr = tbl.insertRow(), td = document.createElement('td');
+    td.colSpan = 2; td.className = 'muted'; td.textContent = '（暂无映射）';
+    tr.append(td);
+  }
   const l = s.login;
   if (l && l.active) {
     $('loginCard').style.display = 'block';
