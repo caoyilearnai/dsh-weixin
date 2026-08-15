@@ -9,6 +9,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { WeixinChannel, chunkText } from '../src/index.mjs'
 import { resolveWorkspaceDir } from '../src/creds.mjs'
+import { normalizeInboundMessages } from '../src/ilink.mjs'
 
 function makeStore() {
   return {
@@ -151,4 +152,59 @@ test('push 主动推送：单用户与 all 广播', async () => {
 test('resolveWorkspaceDir：空值回落到 stateDir/workspace，显式值用显式', () => {
   assert.equal(resolveWorkspaceDir('', '/tmp/state'), '/tmp/state/workspace')
   assert.equal(resolveWorkspaceDir('/custom/ws', '/tmp/state'), '/custom/ws')
+})
+
+test('超时后 turn/end 不重复发送（review I1）', async () => {
+  const ch = makeChannel()
+  let resolved = false
+  // 模拟超时已发生：pending 已从 map 移除，collector 仍残留旧引用
+  ch.collector = {
+    sessionId: SESSION,
+    turn: 9,
+    msgId: 'msg-timeout',
+    parts: ['迟到的完整回复'],
+    pending: { from: FROM, contextToken: 'tok', resolve: () => { resolved = true }, timer: null },
+  }
+  ch.handleSessionEvent({ id: SESSION }, { type: 'turn/end', data: { turn: 9 } })
+  await tick()
+
+  assert.equal(ch.sent.length, 0) // 不重复发送完整回复
+  assert.equal(resolved, true)    // 仍 resolve，避免 handleInbound 悬挂
+  assert.equal(ch.collector, null)
+})
+
+test('sendReply 分块之间也执行调速（review I2）', async () => {
+  const ch = makeChannel({ sendIntervalMs: 40, maxChunk: 10 })
+  const times = []
+  ch.sendChunk = async () => { times.push(Date.now()) }
+  ch.sendReply = WeixinChannel.prototype.sendReply // makeChannel 覆盖过，换回真实实现
+  await ch.sendReply(FROM, undefined, 'x'.repeat(15)) // 切成 10 + 5 两块
+
+  assert.equal(times.length, 2)
+  assert.ok(times[1] - times[0] >= 30, `分块间隔应 ≥ sendIntervalMs，实际 ${times[1] - times[0]}ms`)
+})
+
+test('chunkText 不切开 emoji 代理对（review S4）', () => {
+  const parts = chunkText('a'.repeat(4) + '😀' + 'a'.repeat(4), 5)
+  assert.ok(parts.length >= 2)
+  assert.equal(parts[0], 'aaaa') // 修复后 cut 退到 emoji 前，emoji 完整进入下一块
+  for (const p of parts) {
+    assert.doesNotMatch(p, /[\ud800-\udbff]$/, `以高位代理结尾（半个字符）：${JSON.stringify(p)}`)
+    assert.doesNotMatch(p, /^[\udc00-\udfff]/, `以低位代理开头（半个字符）：${JSON.stringify(p)}`)
+  }
+})
+
+test('normalizeInboundMessages：文本/非文本/空响应（review S10）', () => {
+  assert.deepEqual(normalizeInboundMessages({}), [])
+  assert.deepEqual(normalizeInboundMessages(null), [])
+  const out = normalizeInboundMessages({
+    msgs: [
+      { from_user_id: 'u1', to_user_id: 'bot', context_token: 'c1', item_list: [{ type: 1, text_item: { text: '你好' } }] },
+      { from_user_id: 'u2', to_user_id: 'bot', context_token: 'c2', item_list: [{ type: 3, text_item: {} }] },
+      { from_user_id: '', item_list: [{ type: 1, text_item: { text: '无 from 忽略' } }] },
+    ],
+  })
+  assert.equal(out.length, 2)
+  assert.deepEqual(out[0], { from: 'u1', to: 'bot', contextToken: 'c1', text: '你好', hasText: true, nonTextTypes: [] })
+  assert.deepEqual(out[1], { from: 'u2', to: 'bot', contextToken: 'c2', text: '', hasText: false, nonTextTypes: [3] })
 })

@@ -44,6 +44,12 @@ export function chunkText(text, max) {
   while (rest.length > limit) {
     let cut = rest.lastIndexOf('\n', limit)
     if (cut < limit / 2) cut = limit
+    // 不切开 UTF-16 代理对（emoji 等占 2 个码元），否则会产生半个字符（review S4）
+    if (cut > 0 && cut < rest.length) {
+      const prev = rest.charCodeAt(cut - 1)
+      const next = rest.charCodeAt(cut)
+      if (prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) cut -= 1
+    }
     out.push(rest.slice(0, cut))
     rest = rest.slice(cut)
   }
@@ -325,6 +331,12 @@ export class WeixinChannel {
         if (!c || c.sessionId !== sessionId || event.data?.turn !== c.turn) break
         this.collector = null
         const { pending, parts, msgId } = c
+        // 已超时：pending 已被超时分支移除，说明「处理超时」已发出，勿重复发送完整回复（review I1）
+        if (!this.pending.has(msgId)) {
+          if (pending.timer) clearTimeout(pending.timer)
+          pending.resolve()
+          break
+        }
         this.pending.delete(msgId)
         if (pending.timer) clearTimeout(pending.timer)
         const reply = parts.join('\n').trim()
@@ -349,18 +361,23 @@ export class WeixinChannel {
 
   async sendReply(to, contextToken, text) {
     try {
-      await this.paceSend()
       for (const piece of chunkText(text, this.cfg.maxChunk)) {
-        await ilink.sendMessage({
-          baseUrl: this.creds.baseurl, token: this.creds.bot_token,
-          to, text: piece, contextToken, botAgent: this.botAgent,
-          onWarn: (w) => this.pushLog(`发送 ${w}`),
-        })
+        await this.paceSend() // 每个分块发送前都调速（review I2）
+        await this.sendChunk(to, contextToken, piece)
       }
       this.pushLog(`发：${to.slice(0, 12)}… ${text.slice(0, 60)}`)
     } catch (err) {
       this.pushLog(`发送失败：${err?.message ?? err}`)
     }
+  }
+
+  /** 发送单个分块；独立成方法便于测试打桩计时。 */
+  async sendChunk(to, contextToken, piece) {
+    await ilink.sendMessage({
+      baseUrl: this.creds.baseurl, token: this.creds.bot_token,
+      to, text: piece, contextToken, botAgent: this.botAgent,
+      onWarn: (w) => this.pushLog(`发送 ${w}`),
+    })
   }
 
   /**
