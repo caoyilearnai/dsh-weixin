@@ -96,8 +96,9 @@ async function apiGet({ baseUrl, endpoint, timeoutMs }) {
     return JSON.parse(raw)
   } catch (err) {
     if (err instanceof ILinkError) throw err
+    // 仅长轮询超时视为「尚无新状态」；网络/解析等真实错误抛给调用方，勿静默吞掉（review S7）
     if (err?.name === 'AbortError') return { status: 'wait' }
-    return { status: 'wait' }
+    throw err
   } finally {
     if (t) clearTimeout(t)
   }
@@ -110,6 +111,7 @@ export async function fetchQRCode({ baseUrl = DEFAULT_BASE_URL, botType = '3', l
     baseUrl,
     endpoint: `ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(botType)}`,
     body: { local_token_list: localTokenList },
+    timeoutMs: API_TIMEOUT_MS,
   })
   if (resp.ret && resp.ret !== 0) {
     throw new ILinkError(`get_bot_qrcode ret=${resp.ret}`, { ret: resp.ret, errmsg: resp.errmsg })
