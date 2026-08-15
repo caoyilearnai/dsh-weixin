@@ -41,7 +41,9 @@ function readBody(req, maxBytes = MAX_BODY_BYTES) {
     req.on('data', (chunk) => {
       size += chunk.length
       if (size > maxBytes) {
-        reject(new Error('请求体过大，已拒绝'))
+        const err = new Error('请求体过大，已拒绝')
+        err.statusCode = 413 // 语义上应为 Payload Too Large 而非 500（review 二轮小疵）
+        reject(err)
         req.destroy()
         return
       }
@@ -100,8 +102,20 @@ async function startLogin(channel) {
 
 async function pollLogin(channel, login) {
   try {
+    let failures = 0
     while (Date.now() - login.startedAt < LOGIN_TIMEOUT_MS) {
-      const status = await ilink.pollQRStatus({ baseUrl: login.apiBaseUrl, qrcode: login.qrCode, verifyCode: login.pendingVerifyCode })
+      let status
+      try {
+        status = await ilink.pollQRStatus({ baseUrl: login.apiBaseUrl, qrcode: login.qrCode, verifyCode: login.pendingVerifyCode })
+        failures = 0
+      } catch (err) {
+        // 瞬时网络错误容忍：连续 3 次才终止登录，避免一次抖动废掉整个流程（review 二轮 N2）
+        failures += 1
+        if (failures >= 3) throw err
+        channel.pushLog(`登录轮询瞬时错误（${failures}/3）：${err?.message ?? err}，稍后重试`)
+        await sleep(1000 * failures)
+        continue
+      }
       switch (status.status) {
         case 'wait':
           break
@@ -194,6 +208,10 @@ async function pollLogin(channel, login) {
     channel.pushLog(`登录失败：${err?.message ?? err}`)
   } finally {
     login.poller = null
+    // 终态记录完成时间：面板停止展示二维码，宽限后自动收起卡片（review S3）
+    if (login.status === 'confirmed' || login.status === 'error' || login.status === 'expired') {
+      login.finishedAt = Date.now()
+    }
   }
 }
 
@@ -248,7 +266,7 @@ export function registerPanel(ctx, channel) {
             sendText(res, 'not found', 'text/plain', 404)
           }
         } catch (err) {
-          sendJson(res, { error: err?.message ?? String(err) }, 500)
+          sendJson(res, { error: err?.message ?? String(err) }, err?.statusCode ?? 500)
         }
       },
     }),
