@@ -14,7 +14,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,8 +36,12 @@ test('bin/login.mjs 导入可用且能启动（无 MODULE_NOT_FOUND）', async (
     child.on('close', () => { clearTimeout(timer); resolve({ out, timedOut: false }) })
   })
 
-  // 关键：模块解析不能失败
-  assert.doesNotMatch(run.out, /ERR_MODULE_NOT_FOUND|Cannot find module/, `输出里出现了模块解析错误：\n${run.out}`)
-  // 证明导入成功、main() 真正启动（此句在 main 内、网络请求之前打印）
-  assert.match(run.out, /正在向腾讯 iLink 服务器申请登录二维码/, `未看到 main() 启动提示：\n${run.out}`)
+  try {
+    // 关键：模块解析不能失败
+    assert.doesNotMatch(run.out, /ERR_MODULE_NOT_FOUND|Cannot find module/, `输出里出现了模块解析错误：\n${run.out}`)
+    // 证明导入成功、main() 真正启动（此句在 main 内、网络请求之前打印）
+    assert.match(run.out, /正在向腾讯 iLink 服务器申请登录二维码/, `未看到 main() 启动提示：\n${run.out}`)
+  } finally {
+    await rm(stateDir, { recursive: true, force: true }) // 清理临时状态目录
+  }
 })
