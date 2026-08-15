@@ -23,6 +23,6 @@ jobs:
       - run: npm install
 
       # prepublishOnly 里已挂 `npm test`，测试通过才会真正发布
-      - run: npm publish --provenance
+      - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
