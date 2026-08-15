@@ -4,7 +4,7 @@
  * 协议细节对齐腾讯官方 @tencent-weixin/openclaw-weixin 开源包。
  */
 
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createDecipheriv, randomBytes, randomUUID } from 'node:crypto'
 
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com'
 
@@ -233,6 +233,59 @@ export async function notifyStop({ baseUrl, token, botAgent }) {
   })
 }
 
+/* ------------------------------ 媒体（CDN 下载/解密） ------------------------------ */
+
+/** 微信 CDN 域名（图片/语音/文件下载、上传），与 ilink 主站分离。 */
+export const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c'
+
+/** attachment 服务只收这 4 种栅格图。 */
+const VALID_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+
+/** 从字节头嗅探图片 MIME；未识别回退 image/jpeg（微信图片基本是 JPEG）。 */
+export function sniffImageMime(buf) {
+  if (buf?.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png'
+  if (buf?.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg'
+  if (buf?.length >= 6 && buf.toString('ascii', 0, 4) === 'GIF8') return 'image/gif'
+  if (buf?.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  return 'image/jpeg'
+}
+
+/** 解析 CDN 媒体 aes_key（两种编码：base64(16 字节) 或 base64(32 位 hex 字符串)）。 */
+export function parseAesKey(aesKeyBase64) {
+  const decoded = Buffer.from(aesKeyBase64 ?? '', 'base64')
+  if (decoded.length === 16) return decoded
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString('ascii'))) {
+    return Buffer.from(decoded.toString('ascii'), 'hex')
+  }
+  throw new Error(`aes_key 无法解析为 16 字节密钥（解码长度=${decoded.length}）`)
+}
+
+/** AES-128-ECB 解密（PKCS7，无 IV）。 */
+export function decryptAesEcb(ciphertext, key) {
+  const decipher = createDecipheriv('aes-128-ecb', key, null)
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()])
+}
+
+/**
+ * 下载并解密 CDN 图片，返回明文 Buffer（失败抛错）。
+ * image = { encrypt_query_param, full_url, aesKey }；aesKey 为空表示明文 CDN。
+ * fetchImpl 为测试注入点。
+ */
+export async function downloadImageBytes({ encryptQueryParam, fullUrl, aesKey, cdnBaseUrl = CDN_BASE_URL, fetchImpl = fetch, timeoutMs = API_TIMEOUT_MS }) {
+  const url = fullUrl || `${cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam ?? '')}`
+  const controller = new AbortController()
+  const t = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetchImpl(url, { signal: controller.signal })
+    if (!res.ok) throw new ILinkError(`CDN 下载 HTTP ${res.status}`)
+    const encrypted = Buffer.from(await res.arrayBuffer())
+    if (!aesKey) return encrypted // 明文 CDN（无密钥）
+    return decryptAesEcb(encrypted, parseAesKey(aesKey))
+  } finally {
+    clearTimeout(t)
+  }
+}
+
 /** getupdates 响应 → 轻量入站消息列表。 */
 export function normalizeInboundMessages(resp) {
   const out = []
@@ -244,12 +297,32 @@ export function normalizeInboundMessages(resp) {
     const texts = items
       .filter((it) => it?.type === 1 && it?.text_item?.text != null)
       .map((it) => String(it.text_item.text))
+    // 语音：voice_item.text 是腾讯服务端转写结果，直接用（P1 收语音无需本地 ASR）
+    const voiceTexts = items
+      .filter((it) => it?.type === 3 && it?.voice_item?.text != null)
+      .map((it) => String(it.voice_item.text))
     const nonTextTypes = items.filter((it) => it?.type !== 1).map((it) => it?.type)
-    if (from && (texts.length > 0 || nonTextTypes.length > 0)) {
+
+    // 首张图片的下载信息（喂给 downloadImageBytes）。aeskey 可能是 hex（image_item.aeskey）或 base64（media.aes_key）。
+    let image = null
+    const imgItem = items.find((it) => it?.type === 2 && it?.image_item?.media)
+    if (imgItem) {
+      const m = imgItem.image_item.media
+      const aeskeyHex = imgItem.image_item.aeskey
+      image = {
+        encrypt_query_param: m.encrypt_query_param ?? '',
+        full_url: m.full_url ?? '',
+        aesKey: aeskeyHex ? Buffer.from(aeskeyHex, 'hex').toString('base64') : (m.aes_key ?? ''),
+      }
+    }
+
+    if (from && (texts.length > 0 || voiceTexts.length > 0 || nonTextTypes.length > 0)) {
       out.push({
         from, to, contextToken,
         text: texts.join('\n'),
-        hasText: texts.length > 0,
+        voiceText: voiceTexts.join('\n'),
+        hasText: texts.length > 0 || voiceTexts.length > 0,
+        image,
         nonTextTypes,
       })
     }

@@ -7,9 +7,10 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { WeixinChannel, chunkText } from '../src/index.mjs'
+import { createCipheriv } from 'node:crypto'
+import { WeixinChannel, chunkText, registerPushTool } from '../src/index.mjs'
 import { resolveWorkspaceDir } from '../src/creds.mjs'
-import { normalizeInboundMessages } from '../src/ilink.mjs'
+import { normalizeInboundMessages, sniffImageMime, parseAesKey, downloadImageBytes } from '../src/ilink.mjs'
 
 function makeStore() {
   return {
@@ -173,6 +174,30 @@ test('超时后 turn/end 不重复发送（review I1）', async () => {
   assert.equal(ch.collector, null)
 })
 
+test('turn/end 模型报错且无助手文本：图片不支持 → 回明确提示而非静默', async () => {
+  const ch = makeChannel()
+  const msgId = 'msg-err'
+  ch.pending.set(msgId, { from: FROM, contextToken: 'tok', sessionId: SESSION, resolve: () => {}, timer: null })
+  ch.handleSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 7 } })
+  ch.handleSessionEvent({ id: SESSION }, { type: 'user/message', data: { id: msgId } })
+  ch.handleSessionEvent({ id: SESSION }, { type: 'turn/end', data: { turn: 7, reason: { kind: 'error', error: { message: 'pi-ai model "deepseek-v4-pro" does not support image input', code: 'UNSUPPORTED_CONTENT' } } } })
+  await tick()
+  assert.equal(ch.sent.length, 1)
+  assert.match(ch.sent[0].text, /不支持看图/)
+})
+
+test('turn/end 一般错误且无助手文本：回错误信息', async () => {
+  const ch = makeChannel()
+  const msgId = 'msg-err2'
+  ch.pending.set(msgId, { from: FROM, contextToken: 'tok', sessionId: SESSION, resolve: () => {}, timer: null })
+  ch.handleSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 8 } })
+  ch.handleSessionEvent({ id: SESSION }, { type: 'user/message', data: { id: msgId } })
+  ch.handleSessionEvent({ id: SESSION }, { type: 'turn/end', data: { turn: 8, reason: { kind: 'error', error: { message: 'network down', code: 'E_NET' } } } })
+  await tick()
+  assert.equal(ch.sent.length, 1)
+  assert.match(ch.sent[0].text, /network down/)
+})
+
 test('sendReply 分块之间也执行调速（review I2）', async () => {
   const ch = makeChannel({ sendIntervalMs: 40, maxChunk: 10 })
   const times = []
@@ -205,8 +230,149 @@ test('normalizeInboundMessages：文本/非文本/空响应（review S10）', ()
     ],
   })
   assert.equal(out.length, 2)
-  assert.deepEqual(out[0], { from: 'u1', to: 'bot', contextToken: 'c1', text: '你好', hasText: true, nonTextTypes: [] })
-  assert.deepEqual(out[1], { from: 'u2', to: 'bot', contextToken: 'c2', text: '', hasText: false, nonTextTypes: [3] })
+  assert.deepEqual(out[0], { from: 'u1', to: 'bot', contextToken: 'c1', text: '你好', voiceText: '', hasText: true, image: null, nonTextTypes: [] })
+  assert.deepEqual(out[1], { from: 'u2', to: 'bot', contextToken: 'c2', text: '', voiceText: '', hasText: false, image: null, nonTextTypes: [3] })
+})
+
+test('normalizeInboundMessages：语音转写（voice_item.text）直接进正文', () => {
+  const out = normalizeInboundMessages({
+    msgs: [{ from_user_id: 'u1', to_user_id: 'bot', context_token: 'c1', item_list: [{ type: 3, voice_item: { text: '明天天气怎么样' } }] }],
+  })
+  assert.equal(out.length, 1)
+  assert.equal(out[0].voiceText, '明天天气怎么样')
+  assert.equal(out[0].hasText, true)
+  assert.equal(out[0].image, null)
+})
+
+test('normalizeInboundMessages：提取首张图片下载信息（aeskey hex → base64）', () => {
+  const hex = '00112233445566778899aabbccddeeff'
+  const out = normalizeInboundMessages({
+    msgs: [{
+      from_user_id: 'u1', to_user_id: 'bot', context_token: 'c1',
+      item_list: [{ type: 2, image_item: { media: { encrypt_query_param: 'eqp', full_url: '', aes_key: '' }, aeskey: hex } }],
+    }],
+  })
+  assert.equal(out[0].image.encrypt_query_param, 'eqp')
+  assert.equal(out[0].image.aesKey, Buffer.from(hex, 'hex').toString('base64'))
+})
+
+test('sniffImageMime：识别 JPEG/PNG/GIF/WEBP，未知回退 JPEG', () => {
+  assert.equal(sniffImageMime(Buffer.from([0xff, 0xd8, 0xff, 0xe0])), 'image/jpeg')
+  assert.equal(sniffImageMime(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), 'image/png')
+  assert.equal(sniffImageMime(Buffer.from('GIF89a')), 'image/gif')
+  assert.equal(sniffImageMime(Buffer.concat([Buffer.from('RIFF'), Buffer.from([0, 0, 0, 0]), Buffer.from('WEBP')])), 'image/webp')
+  assert.equal(sniffImageMime(Buffer.from([1, 2, 3])), 'image/jpeg')
+})
+
+test('parseAesKey：兼容 base64(16 字节) 与 base64(32 位 hex)', () => {
+  const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex')
+  assert.deepEqual(parseAesKey(key.toString('base64')), key)
+  assert.deepEqual(parseAesKey(Buffer.from(key.toString('hex'), 'ascii').toString('base64')), key)
+  assert.throws(() => parseAesKey('!!!!'), /无法解析/)
+})
+
+test('downloadImageBytes：下载并 AES-128-ECB 解密', async () => {
+  const key = Buffer.from('00112233445566778899aabbccddeeff', 'hex')
+  const plain = Buffer.from('RIFFxxxxWEBPxxx') // 明文图片字节
+  const cipher = createCipheriv('aes-128-ecb', key, null)
+  const enc = Buffer.concat([cipher.update(plain), cipher.final()])
+  const fakeFetch = async () => ({ ok: true, arrayBuffer: async () => enc.buffer.slice(enc.byteOffset, enc.byteOffset + enc.byteLength) })
+
+  const out = await downloadImageBytes({ encryptQueryParam: 'abc', aesKey: key.toString('base64'), fetchImpl: fakeFetch })
+  assert.deepEqual(out, plain)
+
+  // 明文 CDN（无密钥）原样返回
+  const fetchPlain = async () => ({ ok: true, arrayBuffer: async () => plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength) })
+  const out2 = await downloadImageBytes({ encryptQueryParam: 'abc', aesKey: '', fetchImpl: fetchPlain })
+  assert.deepEqual(out2, plain)
+})
+
+test('handleInbound：语音转写直接作为正文', async () => {
+  const ch = makeChannel()
+  ch.getTypingTicket = async () => ''
+  let got = null
+  ch.ensureAgentFor = async () => ({ id: 'session-v', followup(u) { got = u; throw new Error('capture') } })
+
+  await ch.handleInbound({ from: FROM, to: 'bot@im.bot', contextToken: 'tok', text: '', voiceText: '明天几点', image: null })
+
+  assert.ok(got)
+  assert.equal(got.content.length, 1)
+  assert.equal(got.content[0].type, 'text')
+  assert.equal(got.content[0].text, '明天几点')
+})
+
+test('handleInbound：图片下载解密后注入 image 块（纯图无文字）', async () => {
+  const ch = makeChannel()
+  ch.getTypingTicket = async () => ''
+  ch.supportsVision = async () => true
+  const savedRef = { attachmentId: 'img-1', mediaType: 'image/jpeg', bytes: 4, width: 1, height: 1 }
+  ch.downloadImageBytes = async () => Buffer.from([0xff, 0xd8, 0xff, 0xdb])
+  ch.ctx.attachments = {
+    imageLimits: { maxImageBytes: 10 * 1024 * 1024 },
+    saveImage: async (input) => { ch.lastSave = input; return savedRef },
+  }
+  let got = null
+  ch.ensureAgentFor = async () => ({ id: 'session-img', followup(u) { got = u; throw new Error('capture') } })
+
+  await ch.handleInbound({ from: FROM, to: 'bot@im.bot', contextToken: 'tok', text: '', voiceText: '', image: { encrypt_query_param: 'x', full_url: '', aesKey: '' } })
+
+  assert.ok(got)
+  assert.equal(got.content.length, 1)
+  assert.equal(got.content[0].type, 'image')
+  assert.equal(got.content[0].attachment.attachmentId, 'img-1')
+  assert.equal(ch.lastSave.mediaType, 'image/jpeg') // 嗅探出 JPEG
+})
+
+test('handleInbound：图片下载失败降级为提示文本，不崩溃', async () => {
+  const ch = makeChannel()
+  ch.getTypingTicket = async () => ''
+  ch.supportsVision = async () => true
+  ch.downloadImageBytes = async () => { throw new Error('cdn down') }
+  ch.ctx.attachments = { imageLimits: {}, saveImage: async () => ({}) }
+  let got = null
+  ch.ensureAgentFor = async () => ({ id: 'session-fail', followup(u) { got = u; throw new Error('capture') } })
+
+  await ch.handleInbound({ from: FROM, to: 'bot@im.bot', contextToken: 'tok', text: '', voiceText: '', image: { encrypt_query_param: 'x' } })
+
+  assert.ok(got)
+  assert.equal(got.content[0].type, 'text')
+  assert.equal(got.content[0].text, '[图片处理失败]')
+})
+
+test('handleInbound：模型不看图（纯图片）→ 直接友好提示，不注入图片不跑模型', async () => {
+  const ch = makeChannel()
+  ch.getTypingTicket = async () => ''
+  ch.supportsVision = async () => false
+  let followupCalled = false
+  ch.downloadImageBytes = async () => { throw new Error('不应被调用') }
+  ch.ensureAgentFor = async () => ({ id: 'session-novision', options: {}, followup() { followupCalled = true } })
+
+  await ch.handleInbound({ from: FROM, to: 'bot@im.bot', contextToken: 'tok', text: '', voiceText: '', image: { encrypt_query_param: 'x' } })
+
+  assert.equal(followupCalled, false) // 关键：不进模型，图片块不落会话历史 → 不污染后续轮次
+  assert.equal(ch.sent.length, 1)
+  assert.match(ch.sent[0].text, /不支持看图/)
+})
+
+test('supportsVision：无 llm / 纯文本模型 / 视觉模型 / 缓存', async () => {
+  const ch = makeChannel()
+  // makeCtx().get 返回 undefined → 无 llm 服务
+  assert.equal(await ch.supportsVision({}), false)
+
+  ch.ctx.get = (k) => {
+    if (k === 'llm') return { resolveModelInfo: async () => ({ inputModalities: ['text'] }) }
+    if (k === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-v4-pro' }) }
+  }
+  assert.equal(await ch.supportsVision({}), false) // 纯文本
+
+  let calls = 0
+  ch.ctx.get = (k) => {
+    if (k === 'llm') return { resolveModelInfo: async () => { calls++; return { inputModalities: ['text', 'image'] } } }
+    if (k === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'anthropic', model: 'claude-vision' }) }
+  }
+  assert.equal(await ch.supportsVision({}), true)
+  assert.equal(await ch.supportsVision({}), true) // 命中缓存，不再请求
+  assert.equal(calls, 1)
 })
 
 const hasLoneSurrogate = (s) => {
@@ -284,4 +450,41 @@ test('stopTypingOnce 同一轮只停一次「正在输入」（观察 2 幂等�
   ch.stopTypingOnce(pend)
   ch.stopTypingOnce(pend)
   assert.equal(stops, 1)
+})
+
+test('composeSetup 为微信 agent 注入禁止反问的通道指令（修复卡住）', async () => {
+  const ch = makeChannel() // makeCtx().get 返回 undefined → 无 agentPresets
+  const setup = await ch.composeSetup()
+  assert.equal(typeof setup, 'function')
+
+  const sections = []
+  await setup({ systemPrompt: { section: (s) => sections.push(s) } })
+
+  assert.equal(sections.length, 1)
+  assert.equal(sections[0].name, 'weixin:channel-instruction')
+  assert.ok(sections[0].text.includes('ask_user_question'))
+  assert.equal(typeof sections[0].order, 'number')
+})
+
+test('registerPushTool 注册 push_weixin：缺省发给会话所属用户，显式 all/指定 id 生效', async () => {
+  const registered = []
+  const calls = []
+  const ctx = { tools: { register: (d) => { registered.push(d); return () => {} } } }
+  const channel = {
+    sessionMap: { 'u1@im.wechat': 'session-A', 'u2@im.wechat': 'session-B' },
+    push: async (to, text) => { calls.push({ to, text }); return { sent: 1, failed: 0, targets: [to] } },
+  }
+
+  registerPushTool(ctx, channel)
+  assert.equal(registered.length, 1)
+  const tool = registered[0]
+  assert.equal(tool.name, 'push_weixin')
+  assert.deepEqual(tool.parameters.required, ['text']) // text 必填，to 可省
+
+  await tool.execute({ text: 'hi' }, { agent: { id: 'session-A' } })       // 缺省 → 会话所属用户
+  await tool.execute({ to: 'all', text: 'hi2' }, { agent: { id: 'session-A' } }) // 广播
+  await tool.execute({ to: 'u2@im.wechat', text: 'hi3' }, {})              // 显式指定
+
+  assert.deepEqual(calls.map((c) => c.to), ['u1@im.wechat', 'all', 'u2@im.wechat'])
+  assert.deepEqual(calls.map((c) => c.text), ['hi', 'hi2', 'hi3'])
 })

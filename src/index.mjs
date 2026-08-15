@@ -15,8 +15,8 @@ import { createStore, resolveStateDir, resolveWorkspaceDir } from './creds.mjs'
 import { registerPanel } from './panel.mjs'
 
 export const name = 'dsh-weixin'
-/** 硬依赖：面板需要 webServer；通道需要 agents（查找/创建/恢复代理）。agentPresets 为可选探测。 */
-export const inject = ['webServer', 'agents']
+/** 硬依赖：面板需要 webServer；通道需要 agents（查找/创建/恢复代理）；tools 用于注册主动推送工具；attachments 用于收图（存图喂视觉模型）。agentPresets 为可选探测。 */
+export const inject = ['webServer', 'agents', 'tools', 'attachments']
 
 /** 可配置参数（默认值即 schema 默认，可在 cordis.yml 覆盖）。 */
 export const Config = Schema.object({
@@ -92,6 +92,8 @@ export class WeixinChannel {
     this.status = { baseUrl: null, lastEventAt: null, lastError: null, startedAt: Date.now() }
     this.logs = [] // ring buffer
     this.login = null // 面板登录流程状态
+    this.downloadImageBytes = ilink.downloadImageBytes // 测试注入点（默认走 CDN 下载解密）
+    this.visionCache = new Map() // `provider:model` -> boolean（模型是否支持图片输入）
 
     this.ctx.on('session/event', (session, event) => this.handleSessionEvent(session, event))
     this.ctx.on('dispose', () => this.stop())
@@ -197,8 +199,21 @@ export class WeixinChannel {
 
   async composeSetup() {
     const presets = this.ctx.get('agentPresets')
-    if (!presets) return undefined
     return async (agentCtx) => {
+      // 通道指令：注册到 agent 作用域，只约束本微信会话、不污染网页端。
+      // 关键：禁止 ask_user_question（它走网页 provider，微信端无法应答会卡住整轮）。
+      try {
+        agentCtx.systemPrompt.section({
+          name: 'weixin:channel-instruction',
+          order: 50,
+          text: '你当前通过微信消息通道与用户交流，交流是异步、回合式的文字对话。'
+            + '不要使用 ask_user_question 工具——它会在网页端阻塞等待回答，微信端无法响应会导致整轮卡住。'
+            + '信息不足时：优先在回复正文里直接向用户反问，或采用合理默认值并简要说明你的假设。',
+        })
+      } catch (err) {
+        this.pushLog(`注入通道指令失败：${err?.message ?? err}`)
+      }
+      if (!presets) return
       try {
         const resolved = await presets.resolve(undefined)
         if (resolved?.id) await presets.mount(agentCtx, resolved.id)
@@ -246,14 +261,17 @@ export class WeixinChannel {
   /* ------------------------------ 入站处理 ------------------------------ */
 
   async handleInbound(msg) {
-    const { from, to, contextToken, text, hasText } = msg
+    const { from, to, contextToken } = msg
     if (!to?.endsWith('@im.bot')) return
 
-    if (!hasText) {
-      await this.sendReply(from, contextToken, '当前仅支持文字消息，图片/语音/文件暂不支持 🙏')
+    // 正文：文本优先，其次语音转写（P1：腾讯服务端已 ASR，无需本地识别）
+    const bodyText = (msg.text || msg.voiceText || '').trim()
+    const hasImage = !!msg.image
+    if (!bodyText && !hasImage) {
+      await this.sendReply(from, contextToken, '这个格式暂不支持（目前支持文字 / 图片 / 语音）🙏')
       return
     }
-    this.pushLog(`收：${from.slice(0, 12)}… ${text.slice(0, 60)}`)
+    this.pushLog(`收：${from.slice(0, 12)}… ${(bodyText || '[图片]').slice(0, 60)}`)
 
     // 正在输入提示；发送失败视为 ticket 可能已失效，清缓存下次重建（review S12）
     const ticket = await this.getTypingTicket(from, contextToken)
@@ -270,8 +288,27 @@ export class WeixinChannel {
       return
     }
 
+    // 图片：仅在模型确实支持视觉时注入 image 块。否则图片块会持久化进会话历史，
+    // 导致后续每一轮都把图片重发给纯文本模型 → 每次都报错 → 整段会话「发什么都没反应」。
+    let imageBlock = null
+    if (hasImage) {
+      if (await this.supportsVision(agent?.options)) {
+        if (this.ctx.attachments) imageBlock = await this.resolveImageBlock(msg.image)
+      } else if (!bodyText) {
+        // 纯图片 + 模型不看图：不注入、不跑模型，直接友好提示，避免污染历史
+        this.stopTypingOnce({ from, typingStopped: false })
+        await this.sendReply(from, contextToken, '收到你的图片了，但当前模型是纯文本模型，不支持看图 🙏（可发文字描述）')
+        return
+      }
+      // 有文字 + 模型不看图：忽略图片，继续按纯文字处理
+    }
+
+    const content = []
+    if (bodyText) content.push({ type: 'text', text: bodyText })
+    if (imageBlock) content.push(imageBlock)
+
     const userMessage = makeUserMessage({
-      content: [{ type: 'text', text }],
+      content,
       source: { kind: 'plugin', plugin: 'dsh-weixin' },
     })
 
@@ -295,6 +332,55 @@ export class WeixinChannel {
         this.sendReply(from, contextToken, `😵 处理失败：${err?.message ?? err}`).finally(resolve)
       }
     })
+  }
+
+  /**
+   * 判断会话所用模型是否支持图片输入（保守：无法判断/查不到一律视为不支持）。
+   * 结果按 `provider:model` 缓存，避免每张图都请求模型元数据。
+   */
+  async supportsVision(agentOptions) {
+    try {
+      const llm = this.ctx.get?.('llm')
+      const am = this.ctx.get?.('agentDefaultModel')
+      if (!llm) return false
+      const sel = am?.currentSelection?.() ?? {}
+      const provider = agentOptions?.provider || sel.provider
+      const model = agentOptions?.model || sel.model
+      if (!provider || !model) return false
+      const key = `${provider}:${model}`
+      if (this.visionCache.has(key)) return this.visionCache.get(key)
+      const info = await llm.resolveModelInfo(provider, model)
+      const ok = Array.isArray(info?.inputModalities) && info.inputModalities.includes('image')
+      this.visionCache.set(key, ok)
+      return ok
+    } catch {
+      return false
+    }
+  }
+
+  /** 把微信图片下载解密后存成 Harness 图片附件，返回 image 内容块；失败/超限降级为文本块。 */
+  async resolveImageBlock(image) {
+    const limits = this.ctx.attachments?.imageLimits
+    const maxBytes = limits?.maxImageBytes ?? 0
+    try {
+      const bytes = await this.downloadImageBytes({
+        encryptQueryParam: image.encrypt_query_param,
+        fullUrl: image.full_url,
+        aesKey: image.aesKey,
+      })
+      if (maxBytes && bytes.byteLength > maxBytes) {
+        this.pushLog(`图片超限 ${bytes.byteLength}B > ${maxBytes}B，略过图片理解`)
+        return { type: 'text', text: '[图片过大，未处理]' }
+      }
+      const attachment = await this.ctx.attachments.saveImage({
+        data: bytes, // Buffer 即 Uint8Array
+        mediaType: ilink.sniffImageMime(bytes),
+      })
+      return { type: 'image', attachment }
+    } catch (err) {
+      this.pushLog(`图片下载/解密/入库失败：${err?.message ?? err}`)
+      return { type: 'text', text: '[图片处理失败]' }
+    }
   }
 
   /** 取消「正在输入」指示（status=2），失败静默（review S12）。 */
@@ -369,8 +455,18 @@ export class WeixinChannel {
         this.pending.delete(msgId)
         if (pending.timer) clearTimeout(pending.timer)
         const reply = parts.join('\n').trim()
-        const send = reply
-          ? this.sendReply(pending.from, pending.contextToken, reply)
+        // 模型报错且无任何助手文本（如「模型不支持图片输入」）时，不再静默吞掉：
+        // 给用户一个明确提示，避免像「图片发过去没反应」这种悬空体验。
+        let outText = reply
+        if (!outText && event.data?.reason?.kind === 'error') {
+          const emsg = event.data.reason.error?.message ?? ''
+          const ecode = event.data.reason.error?.code ?? ''
+          outText = /image|UNSUPPORTED_CONTENT/i.test(`${emsg} ${ecode}`)
+            ? '收到你的图片了，但当前模型是纯文本模型，不支持看图 🙏（可发文字描述）'
+            : `😵 处理失败：${emsg || '未知错误'}`
+        }
+        const send = outText
+          ? this.sendReply(pending.from, pending.contextToken, outText)
           : Promise.resolve()
         send.finally(() => {
           this.stopTypingOnce(pending) // 轮次结束取消输入指示（review S12）
@@ -491,5 +587,48 @@ export function apply(ctx, config) {
     sendAll: (text) => channel.push('all', text),
     status: () => channel.statusView(),
     sessions: () => ({ ...channel.sessionMap }),
+  })
+  registerPushTool(ctx, channel)
+}
+
+/** 注册 push_weixin 主动推送工具：把 channel.push 暴露给任意 agent（含 DSH schedule 定时触发回合）。 */
+export function registerPushTool(ctx, channel) {
+  return ctx.tools.register({
+    name: 'push_weixin',
+    description: '主动发送一条文本消息到微信。to 为微信用户 id；"all" = 广播给所有已建会话用户；省略 = 发给触发本工具的会话所属微信用户。适合定时任务、告警等主动触达场景。',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: '微信用户 id（如 user@im.wechat）；"all" 广播所有已建会话；省略 = 触发本工具的会话所属用户' },
+        text: { type: 'string', description: '要发送的文本（超过 maxChunk 自动切分）' },
+      },
+      required: ['text'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          sent: { type: 'number' },
+          failed: { type: 'number' },
+          targets: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['sent', 'failed', 'targets'],
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `微信推送结果：成功 ${value?.sent ?? 0}，失败 ${value?.failed ?? 0}（目标 ${value?.targets?.length ?? 0}）`,
+      }],
+    },
+    async execute(args, exec) {
+      const explicit = args.to && String(args.to).trim()
+      let to = explicit || null
+      if (!to) {
+        // 缺省时优先发给触发本工具的会话所属微信用户（schedule 到点醒来正好对应该用户），否则广播
+        const sid = exec?.agent?.id
+        const owner = sid ? Object.keys(channel.sessionMap).find((u) => channel.sessionMap[u] === sid) : undefined
+        to = owner || 'all'
+      }
+      return channel.push(to, String(args.text ?? ''))
+    },
   })
 }
