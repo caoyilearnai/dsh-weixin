@@ -31,7 +31,11 @@ function loadJson(file, def) {
 
 function saveJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, JSON.stringify(data, null, 2))
+  // 原子写 + 0600 权限：先写临时文件再 rename，避免中途崩溃留下半截文件；
+  // 0o600 防止 bot_token 等凭据对同机其它用户可读（review I4、S9）
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 })
+  fs.renameSync(tmp, file)
 }
 
 /** 以 stateDir 为根创建状态存储。 */
