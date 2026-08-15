@@ -47,15 +47,16 @@ export function chunkText(text, max) {
   while (rest.length > limit) {
     let cut = rest.lastIndexOf('\n', limit)
     if (cut < limit / 2) cut = limit
-    // 不切开 UTF-16 代理对（emoji 等占 2 个码元），否则会产生半个字符（review S4）
+    // 切点不得落在 UTF-16 代理对之间（emoji 占 2 码元）。优先左移一格，把整个字符留给
+    // 下一块；若已顶到块首（如 maxChunk=1 且以 emoji 开头）无法左移，则右移一格把整个
+    // 字符纳入本块——宁可本块超 1 码元，也不产出半个字符，并保证 rest 一定前进。
     if (cut > 0 && cut < rest.length) {
       const prev = rest.charCodeAt(cut - 1)
       const next = rest.charCodeAt(cut)
-      if (prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) cut -= 1
+      if (prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+        cut = cut - 1 > 0 ? cut - 1 : cut + 1
+      }
     }
-    // 兜底前进量：极端配置（maxChunk=1 + emoji 开头）下回退可能把 cut 减到 0，
-    // 导致 push 空串、rest 不前进的死循环（review 二轮 N1）
-    cut = Math.max(1, cut)
     out.push(rest.slice(0, cut))
     rest = rest.slice(cut)
   }
@@ -275,12 +276,14 @@ export class WeixinChannel {
     })
 
     await new Promise((resolve) => {
+      const pend = { from, contextToken, sessionId: agent.id, resolve, timer: null, typingStopped: false }
       const timer = setTimeout(() => {
         this.pending.delete(userMessage.id)
-        this.stopTyping(from)
+        this.stopTypingOnce(pend)
         this.sendReply(from, contextToken, '⏰ 处理超时，请稍后再试').finally(resolve)
       }, this.cfg.replyTimeoutMs)
-      this.pending.set(userMessage.id, { from, contextToken, sessionId: agent.id, resolve, timer })
+      pend.timer = timer
+      this.pending.set(userMessage.id, pend)
       try {
         agent.followup(userMessage)
       } catch (err) {
@@ -288,17 +291,25 @@ export class WeixinChannel {
         clearTimeout(timer)
         this.pending.delete(userMessage.id)
         this.pushLog(`followup 失败：${err?.message ?? err}`)
+        this.stopTypingOnce(pend) // 同步失败也要取消「正在输入」，否则指示会一直挂着
         this.sendReply(from, contextToken, `😵 处理失败：${err?.message ?? err}`).finally(resolve)
       }
     })
   }
 
-  /** 轮次结束/超时：取消「正在输入」指示（status=2），失败静默（review S12）。 */
+  /** 取消「正在输入」指示（status=2），失败静默（review S12）。 */
   stopTyping(userId) {
     const ticket = this.typingTickets.get(userId)
     if (!this.creds?.bot_token || !ticket) return
     ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: userId, typingTicket: ticket, status: 2, botAgent: this.botAgent })
       .catch(() => {})
+  }
+
+  /** 幂等取消：同一轮只停一次「正在输入」，超时/同步失败/turn-end 多路共用，避免重复 status=2。 */
+  stopTypingOnce(pend) {
+    if (!pend || pend.typingStopped) return
+    pend.typingStopped = true
+    this.stopTyping(pend.from)
   }
 
   async getTypingTicket(userId, contextToken) {
@@ -351,7 +362,7 @@ export class WeixinChannel {
         // 已超时：pending 已被超时分支移除，说明「处理超时」已发出，勿重复发送完整回复（review I1）
         if (!this.pending.has(msgId)) {
           if (pending.timer) clearTimeout(pending.timer)
-          this.stopTyping(pending.from)
+          this.stopTypingOnce(pending)
           pending.resolve()
           break
         }
@@ -362,7 +373,7 @@ export class WeixinChannel {
           ? this.sendReply(pending.from, pending.contextToken, reply)
           : Promise.resolve()
         send.finally(() => {
-          this.stopTyping(pending.from) // 轮次结束取消输入指示（review S12）
+          this.stopTypingOnce(pending) // 轮次结束取消输入指示（review S12）
           pending.resolve()
         })
         break
@@ -412,6 +423,8 @@ export class WeixinChannel {
   /**
    * 主动推送（无需入站 contextToken）。供 ctx.weixin 服务 / 面板 /weixin/send 路由调用。
    * @param {string} to 微信用户 id；'all' 广播给所有已建会话用户
+   * @param {string} text 要发送的文本（超过 maxChunk 会自动切分）
+   * @returns {Promise<{sent: number, failed: number, targets: string[]}>} sent/failed 为真实发送结果（而非目标数）
    */
   async push(to, text) {
     if (!this.creds?.bot_token) throw new Error('微信通道未登录，无法推送')
@@ -424,13 +437,15 @@ export class WeixinChannel {
       if (await this.sendReply(t, undefined, text)) sent += 1
       else failed += 1
     }
-    this.pushLog(`主动推送完成：${text.slice(0, 40)} → 成功 ${sent}/${targets.length}`)
+    const failNote = failed > 0 ? `（失败 ${failed}）` : ''
+    this.pushLog(`主动推送完成：${text.slice(0, 40)} → 成功 ${sent}/${targets.length}${failNote}`)
     return { sent, failed, targets }
   }
 
   /* ------------------------------ 面板用状态 ------------------------------ */
 
   statusView() {
+    this.pruneLogin() // 显式清理过期的登录终态：读路径本身无副作用（review S3 观察项）
     return {
       connected: this.monitorRunning && !!this.creds?.bot_token,
       loggedInAt: this.creds?.loggedInAt ?? null,
@@ -442,14 +457,18 @@ export class WeixinChannel {
     }
   }
 
+  /** 登录卡片已到终态（confirmed/error/expired）并超过宽限期，就清空 login 状态（review S3）。 */
+  pruneLogin(now = Date.now()) {
+    const l = this.login
+    if (l?.finishedAt && now - l.finishedAt > LOGIN_DONE_GRACE_MS) {
+      this.login = null
+    }
+  }
+
+  /** 纯读：登录卡片视图。不修改状态，清理由 pruneLogin 显式完成。 */
   loginView() {
     const l = this.login
     if (!l) return { active: false }
-    // 终态保留最终提示一小段后自动清理：面板卡片收起、停止轮询 qr.svg（review S3）
-    if (l.finishedAt && Date.now() - l.finishedAt > LOGIN_DONE_GRACE_MS) {
-      this.login = null
-      return { active: false }
-    }
     return {
       active: true,
       status: l.status,

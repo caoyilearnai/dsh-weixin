@@ -209,11 +209,35 @@ test('normalizeInboundMessages：文本/非文本/空响应（review S10）', ()
   assert.deepEqual(out[1], { from: 'u2', to: 'bot', contextToken: 'c2', text: '', hasText: false, nonTextTypes: [3] })
 })
 
-test('chunkText 极小 maxChunk + emoji 开头：有限步终止且不丢字（review 二轮 N1 回归防护）', () => {
-  // 回归背景：代理对回退曾把 cut 减到 0 → push 空串、rest 不前进 → 死循环至 RangeError
-  const parts = chunkText('😀x', 1)
-  assert.ok(parts.length >= 2)
-  assert.equal(parts.join(''), '😀x')
+const hasLoneSurrogate = (s) => {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const n = s.charCodeAt(i + 1)
+      if (!(n >= 0xdc00 && n <= 0xdfff)) return true // 高位代理后无低位 → 孤立
+      i += 1
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return true // 孤立低位代理
+    }
+  }
+  return false
+}
+
+test('chunkText 极端 maxChunk + emoji：不拆代理对、不丢字、有限步终止（review 二轮 N1）', () => {
+  const cases = [
+    ['😀x', 1],
+    ['😀x', 2],
+    ['a😀b', 2],
+    ['😀😀', 2],
+    ['啦啦😀啦', 3],
+  ]
+  for (const [input, max] of cases) {
+    const parts = chunkText(input, max)
+    assert.equal(parts.join(''), input, `${JSON.stringify(input)} @max=${max} 丢字`)
+    for (const p of parts) {
+      assert.equal(hasLoneSurrogate(p), false, `块 ${JSON.stringify(p)} 含孤立代理 @max=${max}`)
+    }
+  }
 })
 
 test('paceSend 并发调用仍按 sendIntervalMs 串行（review S6）', async () => {
@@ -241,12 +265,23 @@ test('push 返回真实成功/失败计数（review S5）', async () => {
 test('登录终态宽限后自动清理 login（review S3）', () => {
   const ch = makeChannel()
   ch.login = { status: 'confirmed', message: '登录成功！', qrUrl: 'https://x', startedAt: Date.now(), finishedAt: Date.now() }
-  const v1 = ch.loginView()
+  const v1 = ch.statusView().login
   assert.equal(v1.active, true)
   assert.equal(v1.status, 'confirmed')
   assert.equal(v1.hasQr, false) // 终态不再展示二维码，面板停止轮询 qr.svg
+  assert.equal(ch.login !== null, true) // loginView 纯读：宽限内不清状态
   ch.login.finishedAt = Date.now() - 11_000 // 超过 LOGIN_DONE_GRACE_MS
-  const v2 = ch.loginView()
+  const v2 = ch.statusView().login // statusView 显式调用 pruneLogin 清理
   assert.equal(v2.active, false)
   assert.equal(ch.login, null)
+})
+
+test('stopTypingOnce 同一轮只停一次「正在输入」（观察 2 幂等）', () => {
+  const ch = makeChannel()
+  let stops = 0
+  ch.stopTyping = () => { stops += 1 }
+  const pend = { from: FROM, typingStopped: false }
+  ch.stopTypingOnce(pend)
+  ch.stopTypingOnce(pend)
+  assert.equal(stops, 1)
 })
