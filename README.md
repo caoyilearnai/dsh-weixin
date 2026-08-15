@@ -99,7 +99,7 @@ curl -X POST http://127.0.0.1:3080/weixin/send \
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `cwd` | `process.cwd()` | 新会话的工作目录（绝对路径） |
+| `cwd` | `stateDir/workspace`（空则自动，可显式覆盖） | 新会话工作目录 / 会话持久化命名空间（绝对路径） |
 | `stateDir` | `$DSH_HOME/dsh-weixin`（无则 `~/.dsh/dsh-weixin`） | 凭证/会话映射/游标的目录 |
 | `replyMode` | `full` | `full` 整轮文本 / `last` 只回最后一条 |
 | `replyTimeoutMs` | `900000` | 单轮回复超时（毫秒） |

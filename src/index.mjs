@@ -11,7 +11,7 @@
 import { randomUUID } from 'node:crypto'
 import Schema from '@deepseek-ai/schemastery'
 import * as ilink from './ilink.mjs'
-import { createStore, resolveStateDir } from './creds.mjs'
+import { createStore, resolveStateDir, resolveWorkspaceDir } from './creds.mjs'
 import { registerPanel } from './panel.mjs'
 
 export const name = 'dsh-weixin'
@@ -20,8 +20,9 @@ export const inject = ['webServer', 'agents']
 
 /** 可配置参数（默认值即 schema 默认，可在 cordis.yml 覆盖）。 */
 export const Config = Schema.object({
-  // 新会话的工作目录（绝对路径）
-  cwd: Schema.string().default(process.cwd()),
+  // 新会话的工作目录（绝对路径，决定会话持久化命名空间与文件工具根）；
+  // 空 = 自动（stateDir/workspace，跨重启稳定）
+  cwd: Schema.string().default(''),
   // 状态目录（凭证/会话映射/游标）；空 = 自动（$DSH_HOME/dsh-weixin 或 ~/.dsh/dsh-weixin）
   stateDir: Schema.string().default(''),
   // 回复风格：full 整轮文本 / last 只回最后一条
@@ -403,8 +404,10 @@ export class WeixinChannel {
 }
 
 export function apply(ctx, config) {
-  const store = createStore(resolveStateDir(config.stateDir))
-  const channel = new WeixinChannel(ctx, config, store)
+  const stateDir = resolveStateDir(config.stateDir)
+  const cwd = resolveWorkspaceDir(config.cwd, stateDir)
+  const store = createStore(stateDir)
+  const channel = new WeixinChannel(ctx, { ...config, cwd }, store)
   registerPanel(ctx, channel)
   // 对外暴露主动推送能力：其它插件 inject ['weixin'] 后用 ctx.weixin.push / sendAll
   ctx.provide('weixin', {

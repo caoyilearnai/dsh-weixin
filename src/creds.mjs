@@ -15,6 +15,12 @@ export function resolveStateDir(configStateDir) {
   return path.join(base, 'dsh-weixin')
 }
 
+/** 解析 agent 工作目录（会话命名空间 + 文件工具根）。Config.cwd 为空时取 stateDir/workspace，保证跨重启稳定。 */
+export function resolveWorkspaceDir(configCwd, stateDir) {
+  if (configCwd && String(configCwd).trim()) return path.resolve(String(configCwd).trim())
+  return path.join(path.resolve(stateDir), 'workspace')
+}
+
 function loadJson(file, def) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'))

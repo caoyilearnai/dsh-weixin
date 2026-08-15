@@ -8,6 +8,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { WeixinChannel, chunkText } from '../src/index.mjs'
+import { resolveWorkspaceDir } from '../src/creds.mjs'
 
 function makeStore() {
   return {
@@ -145,4 +146,9 @@ test('push 主动推送：单用户与 all 广播', async () => {
   const r2 = await ch.push('all', '广播')
   assert.equal(r2.sent, 2)
   assert.equal(ch.sent.length, 2)
+})
+
+test('resolveWorkspaceDir：空值回落到 stateDir/workspace，显式值用显式', () => {
+  assert.equal(resolveWorkspaceDir('', '/tmp/state'), '/tmp/state/workspace')
+  assert.equal(resolveWorkspaceDir('/custom/ws', '/tmp/state'), '/custom/ws')
 })
