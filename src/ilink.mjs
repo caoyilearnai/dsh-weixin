@@ -138,10 +138,11 @@ export async function getUpdates({ baseUrl, token, buf = '', timeoutMs = LONG_PO
   })
 }
 
-/** 发送文本消息；带限流（ret=-2）指数退避重试。 */
+/** 发送文本消息；带限流（ret=-2）指数退避重试。post/backoffBaseMs 为测试注入点（review S10）。 */
 export async function sendMessage({
   baseUrl, token, to, text, contextToken, botAgent,
   maxAttempts = 5, onWarn,
+  post = apiPost, backoffBaseMs = 1000,
 }) {
   const body = {
     msg: {
@@ -158,7 +159,7 @@ export async function sendMessage({
   let lastErr = null
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const resp = await apiPost({
+      const resp = await post({
         baseUrl, endpoint: 'ilink/bot/sendmessage', token, timeoutMs: API_TIMEOUT_MS, body,
       })
       const ret = resp?.ret ?? 0
@@ -167,7 +168,7 @@ export async function sendMessage({
         const rateLimited = ret === -2 || /rate/i.test(String(errmsg))
         lastErr = new ILinkError(`sendmessage ret=${ret} errmsg=${errmsg}`, { ret, errmsg })
         if (rateLimited && attempt < maxAttempts) {
-          const wait = Math.min(2 ** attempt, 16) * 1000
+          const wait = Math.min(2 ** attempt, 16) * backoffBaseMs
           onWarn?.(`限流（ret=${ret}），${wait / 1000}s 后重试`)
           await sleep(wait)
           continue
@@ -179,7 +180,7 @@ export async function sendMessage({
       if (err instanceof ILinkError) throw err
       lastErr = err
       if (attempt < maxAttempts) {
-        const wait = Math.min(2 ** attempt, 16) * 1000
+        const wait = Math.min(2 ** attempt, 16) * backoffBaseMs
         onWarn?.(`网络错误重试：${err?.message ?? err}`)
         await sleep(wait)
       }
