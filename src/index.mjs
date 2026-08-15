@@ -115,10 +115,12 @@ export class WeixinChannel {
       try {
         const resp = await ilink.getUpdates({
           baseUrl: cred.baseurl, token: cred.bot_token, buf: this.buf, botAgent: this.botAgent,
+          signal: aborter.signal,
         })
         if (this.stopped || aborter.signal.aborted) break
         failures = 0
         this.status.lastEventAt = Date.now()
+        this.status.lastError = null
         if (typeof resp?.get_updates_buf === 'string' && resp.get_updates_buf) {
           this.buf = resp.get_updates_buf
           this.store.saveBuf(this.buf)

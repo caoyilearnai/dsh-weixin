@@ -32,12 +32,23 @@ function sendText(res, text, contentType = 'text/plain; charset=utf-8', status =
   res.end(text)
 }
 
-function readBody(req) {
-  return new Promise((resolve) => {
+const MAX_BODY_BYTES = 1024 * 1024 // 1MB 上限，防止超大请求体撑内存
+
+function readBody(req, maxBytes = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
     let data = ''
-    req.on('data', (chunk) => { data += chunk })
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > maxBytes) {
+        reject(new Error('请求体过大，已拒绝'))
+        req.destroy()
+        return
+      }
+      data += chunk
+    })
     req.on('end', () => resolve(data))
-    req.on('error', () => resolve(''))
+    req.on('error', (err) => reject(err))
   })
 }
 
@@ -130,9 +141,26 @@ async function pollLogin(channel, login) {
           }
           break
         case 'binded_redirect':
-          login.status = 'confirmed'
-          login.message = '该微信已绑定过，凭据可直接使用'
-          return
+          // 已有 token（重连）：沿用现有凭据视为成功；首次登录（无 token）则刷新二维码重试
+          if (channel.creds?.bot_token) {
+            login.status = 'confirmed'
+            login.message = '该微信已绑定，沿用现有凭据'
+            return
+          }
+          login.qrRefreshCount += 1
+          if (login.qrRefreshCount > MAX_QR_REFRESH) {
+            login.status = 'error'
+            login.message = '该微信已绑定其它机器人，无法获取新凭据，请确认后重试'
+            return
+          }
+          login.pendingVerifyCode = undefined
+          login.message = '该微信已绑定其它机器人，刷新二维码…'
+          {
+            const qr = await ilink.fetchQRCode({ localTokenList: channel.creds?.bot_token ? [channel.creds.bot_token] : [] })
+            login.qrCode = qr?.qrcode ?? login.qrCode
+            login.qrUrl = qr?.qrcode_img_content ?? login.qrUrl
+          }
+          break
         case 'scaned_but_redirect':
           if (status.redirect_host) {
             login.apiBaseUrl = `https://${status.redirect_host}`

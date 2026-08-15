@@ -109,8 +109,18 @@ async function main() {
         break
       }
       case 'binded_redirect':
-        console.log('\n✅ 该微信已绑定过，凭据可直接使用（重启 dsh web 后插件自动生效）')
-        return
+        if (existing?.bot_token) {
+          console.log('\n✅ 该微信已绑定，沿用现有凭据（重启 dsh web 后插件自动生效）')
+          return
+        }
+        qrRefreshCount += 1
+        if (qrRefreshCount > MAX_QR_REFRESH) { console.error('❌ 该微信已绑定其它机器人，无法获取新凭据'); process.exit(1) }
+        console.log(`\n🔄 该微信已绑定其它机器人，刷新二维码（${qrRefreshCount}/${MAX_QR_REFRESH}）…`)
+        qr = await ilink.fetchQRCode({ localTokenList })
+        qrcodeValue = qr?.qrcode; qrUrl = qr?.qrcode_img_content
+        console.log(renderQr(qrUrl))
+        pendingVerifyCode = undefined; scannedPrinted = false
+        break
       case 'scaned_but_redirect':
         if (status.redirect_host) {
           apiBaseUrl = `https://${status.redirect_host}`

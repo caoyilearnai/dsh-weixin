@@ -50,22 +50,25 @@ function buildBaseInfo(botAgent) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-async function apiPost({ baseUrl, endpoint, body, token, timeoutMs }) {
+async function apiPost({ baseUrl, endpoint, body, token, timeoutMs, signal }) {
   const base = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`
   const controller = timeoutMs ? new AbortController() : undefined
   const t = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined
+  // 组合外部中止信号（供 stop/登出打断长轮询）与超时信号
+  const signals = [signal, controller?.signal].filter(Boolean)
   try {
     const res = await fetch(new URL(endpoint, base).toString(), {
       method: 'POST',
       headers: buildHeaders({ token }),
       body: JSON.stringify(body),
-      ...(controller ? { signal: controller.signal } : {}),
+      ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
     })
     const raw = await res.text()
     if (!res.ok) throw new ILinkError(`${endpoint} HTTP ${res.status}: ${raw.slice(0, 200)}`)
     return JSON.parse(raw)
   } catch (err) {
     if (err instanceof ILinkError) throw err
+    // 长轮询超时/被外部中止都按「无新消息」返回；循环会检查 aborted 决定是否继续
     if (err?.name === 'AbortError' && timeoutMs === LONG_POLL_TIMEOUT_MS) {
       return { ret: 0, msgs: [], get_updates_buf: body?.get_updates_buf ?? '' }
     }
@@ -122,12 +125,13 @@ export async function pollQRStatus({ baseUrl = DEFAULT_BASE_URL, qrcode, verifyC
 
 /* ------------------------------ 消息 ------------------------------ */
 
-export async function getUpdates({ baseUrl, token, buf = '', timeoutMs = LONG_POLL_TIMEOUT_MS, botAgent }) {
+export async function getUpdates({ baseUrl, token, buf = '', timeoutMs = LONG_POLL_TIMEOUT_MS, botAgent, signal }) {
   return apiPost({
     baseUrl,
     endpoint: 'ilink/bot/getupdates',
     token,
     timeoutMs,
+    signal,
     body: { get_updates_buf: buf, base_info: buildBaseInfo(botAgent) },
   })
 }
