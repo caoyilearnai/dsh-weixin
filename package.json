@@ -29,11 +29,20 @@
     "qrcode-generator": "^2.0.4"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/caoyilearnai/dsh-weixin.git"
+  },
+  "homepage": "https://github.com/caoyilearnai/dsh-weixin#readme",
+  "bugs": {
+    "url": "https://github.com/caoyilearnai/dsh-weixin/issues"
+  },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepublishOnly": "npm test"
   },
   "keywords": [
     "deepseek-harness",
