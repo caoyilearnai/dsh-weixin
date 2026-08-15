@@ -67,12 +67,24 @@ async function main() {
   let scannedPrinted = false
   console.log('\n⏳ 等待扫码确认（5 分钟内有效）…')
 
+  let pollFailures = 0
   for (;;) {
     if (Date.now() - startedAt > LOGIN_TIMEOUT_MS) {
       console.error('❌ 超时未完成登录，请重新运行 node bin/login.mjs')
       process.exit(1)
     }
-    const status = await ilink.pollQRStatus({ baseUrl: apiBaseUrl, qrcode: qrcodeValue, verifyCode: pendingVerifyCode })
+    let status
+    try {
+      status = await ilink.pollQRStatus({ baseUrl: apiBaseUrl, qrcode: qrcodeValue, verifyCode: pendingVerifyCode })
+      pollFailures = 0
+    } catch (err) {
+      // 瞬时网络错误容忍：连续 3 次才终止，避免一次抖动废掉整个登录（review 二轮 N2）
+      pollFailures += 1
+      if (pollFailures >= 3) throw err
+      console.warn(`⚠️ 轮询瞬时错误（${pollFailures}/3）：${err?.message ?? err}，稍后重试…`)
+      await sleep(1000 * pollFailures)
+      continue
+    }
     switch (status.status) {
       case 'wait':
         break
