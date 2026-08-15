@@ -1,6 +1,6 @@
 {
   "name": "dsh-weixin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "微信 ClawBot (iLink) 通道插件：把微信消息接入 DeepSeek Harness 会话，按用户隔离、原生注入与回发。",
   "type": "module",
   "main": "index.mjs",
