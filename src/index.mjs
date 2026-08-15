@@ -37,6 +37,9 @@ export const Config = Schema.object({
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/** 登录终态（confirmed/error/expired）后面板保留最终提示的时长，之后自动收起卡片（review S3）。 */
+const LOGIN_DONE_GRACE_MS = 10_000
+
 export function chunkText(text, max) {
   const limit = Math.max(1, Math.floor(max || 1500))
   const out = []
@@ -50,6 +53,9 @@ export function chunkText(text, max) {
       const next = rest.charCodeAt(cut)
       if (prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) cut -= 1
     }
+    // 兜底前进量：极端配置（maxChunk=1 + emoji 开头）下回退可能把 cut 减到 0，
+    // 导致 push 空串、rest 不前进的死循环（review 二轮 N1）
+    cut = Math.max(1, cut)
     out.push(rest.slice(0, cut))
     rest = rest.slice(cut)
   }
@@ -78,6 +84,7 @@ export class WeixinChannel {
     this.pending = new Map() // userMessage.id -> {from, contextToken, sessionId, resolve, timer}
     this.collector = null // { sessionId, turn, msgId, parts, pending }
     this.lastSendAt = 0
+    this.sendQueue = Promise.resolve() // 发送调速队列（review S6）
     this.stopped = false
     this.monitorRunning = false
     this.monitorAbort = new AbortController()
@@ -247,10 +254,11 @@ export class WeixinChannel {
     }
     this.pushLog(`收：${from.slice(0, 12)}… ${text.slice(0, 60)}`)
 
-    // 正在输入提示
+    // 正在输入提示；发送失败视为 ticket 可能已失效，清缓存下次重建（review S12）
     const ticket = await this.getTypingTicket(from, contextToken)
     if (ticket) {
-      await ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: from, typingTicket: ticket, status: 1, botAgent: this.botAgent }).catch(() => {})
+      await ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: from, typingTicket: ticket, status: 1, botAgent: this.botAgent })
+        .catch(() => { this.typingTickets.delete(from) })
     }
 
     let agent
@@ -269,6 +277,7 @@ export class WeixinChannel {
     await new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(userMessage.id)
+        this.stopTyping(from)
         this.sendReply(from, contextToken, '⏰ 处理超时，请稍后再试').finally(resolve)
       }, this.cfg.replyTimeoutMs)
       this.pending.set(userMessage.id, { from, contextToken, sessionId: agent.id, resolve, timer })
@@ -282,6 +291,14 @@ export class WeixinChannel {
         this.sendReply(from, contextToken, `😵 处理失败：${err?.message ?? err}`).finally(resolve)
       }
     })
+  }
+
+  /** 轮次结束/超时：取消「正在输入」指示（status=2），失败静默（review S12）。 */
+  stopTyping(userId) {
+    const ticket = this.typingTickets.get(userId)
+    if (!this.creds?.bot_token || !ticket) return
+    ilink.sendTyping({ baseUrl: this.creds.baseurl, token: this.creds.bot_token, to: userId, typingTicket: ticket, status: 2, botAgent: this.botAgent })
+      .catch(() => {})
   }
 
   async getTypingTicket(userId, contextToken) {
@@ -334,6 +351,7 @@ export class WeixinChannel {
         // 已超时：pending 已被超时分支移除，说明「处理超时」已发出，勿重复发送完整回复（review I1）
         if (!this.pending.has(msgId)) {
           if (pending.timer) clearTimeout(pending.timer)
+          this.stopTyping(pending.from)
           pending.resolve()
           break
         }
@@ -343,7 +361,10 @@ export class WeixinChannel {
         const send = reply
           ? this.sendReply(pending.from, pending.contextToken, reply)
           : Promise.resolve()
-        send.finally(() => pending.resolve())
+        send.finally(() => {
+          this.stopTyping(pending.from) // 轮次结束取消输入指示（review S12）
+          pending.resolve()
+        })
         break
       }
       default:
@@ -353,12 +374,18 @@ export class WeixinChannel {
 
   /* ------------------------------ 发送 ------------------------------ */
 
+  /** 调速排队：并发发送也按队列串行预约时间片，保证任意两次发送间隔 ≥ sendIntervalMs（review S6）。 */
   async paceSend() {
-    const wait = this.lastSendAt + this.cfg.sendIntervalMs - Date.now()
-    if (wait > 0) await sleep(wait)
-    this.lastSendAt = Date.now()
+    const slot = this.sendQueue.then(async () => {
+      const wait = this.lastSendAt + this.cfg.sendIntervalMs - Date.now()
+      if (wait > 0) await sleep(wait)
+      this.lastSendAt = Date.now()
+    })
+    this.sendQueue = slot.catch(() => {}) // 单次失败不断链
+    return slot
   }
 
+  /** @returns {Promise<boolean>} 是否全部分块发送成功（review S5）。 */
   async sendReply(to, contextToken, text) {
     try {
       for (const piece of chunkText(text, this.cfg.maxChunk)) {
@@ -366,8 +393,10 @@ export class WeixinChannel {
         await this.sendChunk(to, contextToken, piece)
       }
       this.pushLog(`发：${to.slice(0, 12)}… ${text.slice(0, 60)}`)
+      return true
     } catch (err) {
       this.pushLog(`发送失败：${err?.message ?? err}`)
+      return false
     }
   }
 
@@ -388,11 +417,15 @@ export class WeixinChannel {
     if (!this.creds?.bot_token) throw new Error('微信通道未登录，无法推送')
     const targets = to === 'all' ? Object.keys(this.sessionMap) : [to]
     if (targets.length === 0) throw new Error('没有可推送的目标用户')
+    // sent/failed 为真实发送结果，而非目标数（review S5）
+    let sent = 0
+    let failed = 0
     for (const t of targets) {
-      await this.sendReply(t, undefined, text)
+      if (await this.sendReply(t, undefined, text)) sent += 1
+      else failed += 1
     }
-    this.pushLog(`主动推送完成：${text.slice(0, 40)} → ${targets.length} 个用户`)
-    return { sent: targets.length, targets }
+    this.pushLog(`主动推送完成：${text.slice(0, 40)} → 成功 ${sent}/${targets.length}`)
+    return { sent, failed, targets }
   }
 
   /* ------------------------------ 面板用状态 ------------------------------ */
@@ -412,10 +445,15 @@ export class WeixinChannel {
   loginView() {
     const l = this.login
     if (!l) return { active: false }
+    // 终态保留最终提示一小段后自动清理：面板卡片收起、停止轮询 qr.svg（review S3）
+    if (l.finishedAt && Date.now() - l.finishedAt > LOGIN_DONE_GRACE_MS) {
+      this.login = null
+      return { active: false }
+    }
     return {
       active: true,
       status: l.status,
-      hasQr: !!l.qrUrl,
+      hasQr: !!l.qrUrl && !l.finishedAt,
       message: l.message ?? '',
       startedAt: l.startedAt,
     }

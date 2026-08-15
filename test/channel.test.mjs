@@ -38,7 +38,7 @@ function makeChannel(config = {}) {
   }
   const ch = new WeixinChannel(makeCtx(), cfg, makeStore())
   const sent = []
-  ch.sendReply = async (to, contextToken, text) => { sent.push({ to, text }) }
+  ch.sendReply = async (to, contextToken, text) => { sent.push({ to, text }); return true }
   ch.sent = sent
   return ch
 }
@@ -207,4 +207,46 @@ test('normalizeInboundMessages：文本/非文本/空响应（review S10）', ()
   assert.equal(out.length, 2)
   assert.deepEqual(out[0], { from: 'u1', to: 'bot', contextToken: 'c1', text: '你好', hasText: true, nonTextTypes: [] })
   assert.deepEqual(out[1], { from: 'u2', to: 'bot', contextToken: 'c2', text: '', hasText: false, nonTextTypes: [3] })
+})
+
+test('chunkText 极小 maxChunk + emoji 开头：有限步终止且不丢字（review 二轮 N1 回归防护）', () => {
+  // 回归背景：代理对回退曾把 cut 减到 0 → push 空串、rest 不前进 → 死循环至 RangeError
+  const parts = chunkText('😀x', 1)
+  assert.ok(parts.length >= 2)
+  assert.equal(parts.join(''), '😀x')
+})
+
+test('paceSend 并发调用仍按 sendIntervalMs 串行（review S6）', async () => {
+  const ch = makeChannel({ sendIntervalMs: 40 })
+  const marks = []
+  await Promise.all([
+    ch.paceSend().then(() => marks.push(Date.now())),
+    ch.paceSend().then(() => marks.push(Date.now())),
+  ])
+  assert.equal(marks.length, 2)
+  assert.ok(marks[1] - marks[0] >= 30, `并发 paceSend 间隔应 ≥ sendIntervalMs，实际 ${marks[1] - marks[0]}ms`)
+})
+
+test('push 返回真实成功/失败计数（review S5）', async () => {
+  const ch = makeChannel()
+  ch.creds = { bot_token: 'tok', baseurl: 'https://ilinkai.weixin.qq.com' }
+  ch.sessionMap = { 'u1@im.wechat': 's1', 'u2@im.wechat': 's2' }
+  ch.sendReply = async () => false // 模拟发送全部失败
+  const r = await ch.push('all', '你好')
+  assert.equal(r.sent, 0)
+  assert.equal(r.failed, 2)
+  assert.deepEqual(r.targets, ['u1@im.wechat', 'u2@im.wechat'])
+})
+
+test('登录终态宽限后自动清理 login（review S3）', () => {
+  const ch = makeChannel()
+  ch.login = { status: 'confirmed', message: '登录成功！', qrUrl: 'https://x', startedAt: Date.now(), finishedAt: Date.now() }
+  const v1 = ch.loginView()
+  assert.equal(v1.active, true)
+  assert.equal(v1.status, 'confirmed')
+  assert.equal(v1.hasQr, false) // 终态不再展示二维码，面板停止轮询 qr.svg
+  ch.login.finishedAt = Date.now() - 11_000 // 超过 LOGIN_DONE_GRACE_MS
+  const v2 = ch.loginView()
+  assert.equal(v2.active, false)
+  assert.equal(ch.login, null)
 })
