@@ -375,6 +375,21 @@ test('supportsVision：无 llm / 纯文本模型 / 视觉模型 / 缓存', async
   assert.equal(calls, 1)
 })
 
+test('resolveDefaultAgentOptions：解析默认模型，缺失则回退空对象', () => {
+  const ch = makeChannel()
+  // makeCtx().get 返回 undefined → 无 agentDefaultModel 服务
+  assert.deepEqual(ch.resolveDefaultAgentOptions(), {})
+
+  ch.ctx.get = (k) => {
+    if (k === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-v4-pro' }) }
+  }
+  assert.deepEqual(ch.resolveDefaultAgentOptions(), { provider: 'deepseek', model: 'deepseek-v4-pro' })
+
+  // 缺 model 字段 → 回退空对象（否则 {{model}} 仍会空值报错）
+  ch.ctx.get = (k) => (k === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'deepseek' }) } : undefined)
+  assert.deepEqual(ch.resolveDefaultAgentOptions(), {})
+})
+
 const hasLoneSurrogate = (s) => {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i)

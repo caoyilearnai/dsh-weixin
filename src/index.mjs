@@ -223,6 +223,18 @@ export class WeixinChannel {
     }
   }
 
+  /** 解析当前默认模型为 AgentOptions（provider + model）。harness 的人设里含 {{model}}/{{provider}} 模板变量，
+   *  只有 agent.options 里显式给了模型才渲染得出来，否则首条消息就报「prompt variable has no value」。 */
+  resolveDefaultAgentOptions() {
+    try {
+      const sel = this.ctx.get('agentDefaultModel')?.currentSelection?.()
+      if (sel?.provider && sel?.model) return { provider: sel.provider, model: sel.model }
+    } catch (err) {
+      this.pushLog(`解析默认模型失败：${err?.message ?? err}`)
+    }
+    return {}
+  }
+
   /** 微信用户 → 会话/代理。已有则复用；持久化会话则恢复；否则新建。 */
   async ensureAgentFor(userId) {
     const sessionId = this.sessionMap[userId]
@@ -231,7 +243,7 @@ export class WeixinChannel {
       if (live) return live
       try {
         const { agent } = await this.ctx.agents.resume({
-          resumeSessionId: sessionId, agentOptions: {}, setup: await this.composeSetup(),
+          resumeSessionId: sessionId, agentOptions: this.resolveDefaultAgentOptions(), setup: await this.composeSetup(),
         })
         this.pushLog(`恢复持久化会话 ${sessionId}（${userId.slice(0, 12)}…）`)
         return agent
@@ -244,7 +256,7 @@ export class WeixinChannel {
     try {
       const { agent } = await this.ctx.agents.create({
         sessionId: newId,
-        agentOptions: {},
+        agentOptions: this.resolveDefaultAgentOptions(),
         meta: { cwd: this.cfg.cwd },
         setup: await this.composeSetup(),
       })
