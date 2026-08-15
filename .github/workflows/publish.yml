@@ -15,12 +15,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 仓库锁文件是 pnpm-lock.yaml：用 pnpm + frozen-lockfile，保证发布依赖解析与本地一致（review S11）
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+          cache: pnpm
 
-      - run: npm install
+      - run: pnpm install --frozen-lockfile
 
       # prepublishOnly 里已挂 `npm test`，测试通过才会真正发布
       - run: npm publish --provenance --access public
