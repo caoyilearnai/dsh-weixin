@@ -2,7 +2,7 @@
  * 核心关联逻辑测试：不依赖真实微信，用合成 session 事件验证
  * pending 关联 → assistant/message 收集 → turn/end 结算 → sendReply。
  *
- * 运行：node --test test/
+ * 运行：node --test（或 npm test）
  */
 
 import test from 'node:test'
@@ -106,4 +106,43 @@ test('长文本按 maxChunk 切分', () => {
   assert.equal(parts[1].startsWith('\n'), true)
   // max<=0 保护
   assert.equal(chunkText('abc', 0).length, 1)
+})
+
+test('followup 同步抛错：清理 pending 并回错误提示', async () => {
+  const ch = makeChannel()
+  ch.getTypingTicket = async () => '' // 跳过 typing，避免网络
+  ch.ensureAgentFor = async () => ({
+    id: 'session-throw',
+    followup() { throw new Error('boom') },
+  })
+
+  await ch.handleInbound({ from: FROM, to: 'bot@im.bot', contextToken: 'tok', text: 'hi', hasText: true })
+
+  assert.equal(ch.sent.length, 1)
+  assert.match(ch.sent[0].text, /处理失败/)
+  assert.match(ch.sent[0].text, /boom/)
+  assert.equal(ch.pending.size, 0)
+})
+
+test('push 主动推送：未登录时抛错', async () => {
+  const ch = makeChannel()
+  await assert.rejects(() => ch.push('u1@im.wechat', 'hi'), /未登录/)
+})
+
+test('push 主动推送：单用户与 all 广播', async () => {
+  const ch = makeChannel()
+  ch.creds = { bot_token: 'tok', baseurl: 'https://ilinkai.weixin.qq.com' }
+  ch.sessionMap = { 'u1@im.wechat': 's1', 'u2@im.wechat': 's2' }
+
+  const r1 = await ch.push('u1@im.wechat', '你好')
+  assert.equal(r1.sent, 1)
+  assert.deepEqual(r1.targets, ['u1@im.wechat'])
+  assert.equal(ch.sent.length, 1)
+  assert.equal(ch.sent[0].to, 'u1@im.wechat')
+  assert.equal(ch.sent[0].text, '你好')
+
+  ch.sent.length = 0
+  const r2 = await ch.push('all', '广播')
+  assert.equal(r2.sent, 2)
+  assert.equal(ch.sent.length, 2)
 })

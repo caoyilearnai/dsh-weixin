@@ -9,6 +9,7 @@
  *   POST /weixin/login   发起扫码登录
  *   POST /weixin/verifycode  提交手机端验证码
  *   POST /weixin/logout  登出
+ *   POST /weixin/send    主动推送（JSON: {to, text}，to 可用 'all' 广播）
  *   GET  /weixin/logs    最近日志
  */
 
@@ -206,6 +207,12 @@ export function registerPanel(ctx, channel) {
           } else if (pathname === '/weixin/verifycode' && req.method === 'POST') {
             const body = JSON.parse((await readBody(req)) || '{}')
             sendJson(res, submitVerifyCode(channel, body?.code ?? ''))
+          } else if (pathname === '/weixin/send' && req.method === 'POST') {
+            const body = JSON.parse((await readBody(req)) || '{}')
+            const to = String(body?.to ?? '')
+            const text = String(body?.text ?? '')
+            if (!to || !text) throw new Error('缺少参数：to / text')
+            sendJson(res, await channel.push(to, text))
           } else if (pathname === '/weixin/logout' && req.method === 'POST') {
             await channel.clearCredentials()
             sendJson(res, { ok: true })

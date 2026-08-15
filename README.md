@@ -14,6 +14,7 @@
 - **每用户一个会话**：微信用户 id → Harness 会话的映射持久化，会话有独立上下文。
 - **原生注入**：消息通过 `agent.followup()` 进入会话，参与历史、标题、持久化。
 - **网页面板**：`/weixin` 提供连接状态、扫码登录、会话映射、日志。
+- **主动推送**：`ctx.weixin` 服务 + `/weixin/send` 路由，可供其它插件/脚本主动推消息。
 
 ## 安装
 
@@ -55,6 +56,33 @@ dsh plugin --profile web remove dsh-weixin
 2. **CLI**：`dsh-weixin-login [stateDir]`（或 `node node_modules/dsh-weixin/bin/login.mjs`）。
 
 登录后的凭据写入状态目录（见下），重启后自动读取，无需重新扫码。
+
+## 主动推送
+
+除「微信来消息 → 回复」外，插件暴露两种主动推送方式（无需入站 `context_token`）：
+
+**1. Cordis 服务**（其它插件调用）：`inject: ['weixin']` 后通过 `ctx.weixin` 使用：
+
+```js
+export const inject = ['weixin']
+export function apply(ctx) {
+  ctx.weixin.push('o9cq...@im.wechat', '你好')  // 推给单个微信用户
+  ctx.weixin.sendAll('全员通知')                 // 广播给所有已建会话用户
+  ctx.weixin.status()                            // 连接状态快照
+  ctx.weixin.sessions()                          // 用户 id → sessionId 映射
+}
+```
+
+**2. HTTP 路由**（脚本 / 调度器调用）：
+
+```sh
+curl -X POST http://127.0.0.1:3080/weixin/send \
+  -H 'content-type: application/json' \
+  -d '{"to":"o9cq...@im.wechat","text":"你好"}'
+# 广播：{"to":"all", "text":"..."}
+```
+
+目标用户 id 可在 `/weixin/status` 的 `sessionMap` 里查到。
 
 ## 配置
 
@@ -113,6 +141,7 @@ dsh-weixin/
 ## 已知限制
 
 - 仅单聊、仅文本（图片/语音/文件回复"暂不支持"提示）。
+- **单轮串行**：一条微信消息会阻塞整个通道直到该轮结束，多用户场景后面的消息会排队等待（单用户无感）。
 - iLink 限流（`ret=-2`）已内置指数退避重试；连发仍可能被腾讯节流。
 - ClawBot 处于灰度测试阶段，腾讯保留调整权利。
 

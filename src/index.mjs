@@ -101,17 +101,21 @@ export class WeixinChannel {
     cred.baseurl = cred.baseurl || ilink.DEFAULT_BASE_URL
     this.status.baseUrl = cred.baseurl
     this.monitorRunning = true
+    // 本地捕获 controller：applyCredentials/clearCredentials 会替换 this.monitorAbort，
+    // 当前循环必须持有旧引用，abort 旧 controller 才能停下本循环（否则会泄漏/重复轮询）。
+    const aborter = this.monitorAbort
     this.pushLog('微信通道启动（iLink 长轮询）')
     try {
       await ilink.notifyStart({ baseUrl: cred.baseurl, token: cred.bot_token, botAgent: this.botAgent })
     } catch { /* 通知失败不阻塞 */ }
 
     let failures = 0
-    while (!this.stopped && !this.monitorAbort.signal.aborted) {
+    while (!this.stopped && !aborter.signal.aborted) {
       try {
         const resp = await ilink.getUpdates({
           baseUrl: cred.baseurl, token: cred.bot_token, buf: this.buf, botAgent: this.botAgent,
         })
+        if (this.stopped || aborter.signal.aborted) break
         failures = 0
         this.status.lastEventAt = Date.now()
         if (typeof resp?.get_updates_buf === 'string' && resp.get_updates_buf) {
@@ -119,6 +123,7 @@ export class WeixinChannel {
           this.store.saveBuf(this.buf)
         }
         for (const msg of ilink.normalizeInboundMessages(resp)) {
+          if (this.stopped || aborter.signal.aborted) break
           await this.handleInbound(msg)
         }
       } catch (err) {
@@ -165,6 +170,7 @@ export class WeixinChannel {
     this.monitorAbort.abort()
     this.monitorAbort = new AbortController()
     this.monitorRunning = false
+    this.stopped = true
     this.creds = null
     this.store.saveCredentials(null)
     this.pushLog('已登出')
@@ -257,7 +263,15 @@ export class WeixinChannel {
         this.sendReply(from, contextToken, '⏰ 处理超时，请稍后再试').finally(resolve)
       }, this.cfg.replyTimeoutMs)
       this.pending.set(userMessage.id, { from, contextToken, sessionId: agent.id, resolve, timer })
-      agent.followup(userMessage)
+      try {
+        agent.followup(userMessage)
+      } catch (err) {
+        // followup 同步抛错（如代理已销毁）：清理 pending/timer 并回错误，避免挂起直到超时
+        clearTimeout(timer)
+        this.pending.delete(userMessage.id)
+        this.pushLog(`followup 失败：${err?.message ?? err}`)
+        this.sendReply(from, contextToken, `😵 处理失败：${err?.message ?? err}`).finally(resolve)
+      }
     })
   }
 
@@ -346,6 +360,21 @@ export class WeixinChannel {
     }
   }
 
+  /**
+   * 主动推送（无需入站 contextToken）。供 ctx.weixin 服务 / 面板 /weixin/send 路由调用。
+   * @param {string} to 微信用户 id；'all' 广播给所有已建会话用户
+   */
+  async push(to, text) {
+    if (!this.creds?.bot_token) throw new Error('微信通道未登录，无法推送')
+    const targets = to === 'all' ? Object.keys(this.sessionMap) : [to]
+    if (targets.length === 0) throw new Error('没有可推送的目标用户')
+    for (const t of targets) {
+      await this.sendReply(t, undefined, text)
+    }
+    this.pushLog(`主动推送完成：${text.slice(0, 40)} → ${targets.length} 个用户`)
+    return { sent: targets.length, targets }
+  }
+
   /* ------------------------------ 面板用状态 ------------------------------ */
 
   statusView() {
@@ -377,4 +406,11 @@ export function apply(ctx, config) {
   const store = createStore(resolveStateDir(config.stateDir))
   const channel = new WeixinChannel(ctx, config, store)
   registerPanel(ctx, channel)
+  // 对外暴露主动推送能力：其它插件 inject ['weixin'] 后用 ctx.weixin.push / sendAll
+  ctx.provide('weixin', {
+    push: (to, text) => channel.push(to, text),
+    sendAll: (text) => channel.push('all', text),
+    status: () => channel.statusView(),
+    sessions: () => ({ ...channel.sessionMap }),
+  })
 }
