@@ -9,8 +9,8 @@
 
 import readline from 'node:readline'
 import qrcode from 'qrcode-generator'
-import * as ilink from './src/ilink.mjs'
-import { createStore, resolveStateDir } from './src/creds.mjs'
+import * as ilink from '../src/ilink.mjs'
+import { createStore, resolveStateDir } from '../src/creds.mjs'
 
 const LOGIN_TIMEOUT_MS = 5 * 60_000
 const MAX_QR_REFRESH = 3
