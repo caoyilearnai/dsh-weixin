@@ -16,46 +16,52 @@
 - **网页面板**：`/weixin` 提供连接状态、扫码登录、会话映射、日志。
 - **主动推送**：`ctx.weixin` 服务 + `/weixin/send` 路由，可供其它插件/脚本主动推消息。
 
-## 安装
+## 快速开始
 
-目标 profile 是 **`web`**（内置 `dsh-base` + `dsh-web-app`，提供 `webServer`/`agents` 服务）。
+> 前提：已安装 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，`dsh` 命令可用。
+
+**1. 安装**（装到 `web` profile，插件依赖它提供的 `webServer`/`agents`）：
 
 ```sh
-# 本地 checkout / tarball
-dsh plugin --profile web add /path/to/dsh-weixin
-
-# 或从 GitHub / npm（开源后的分发方式）
-dsh plugin --profile web add github:you/dsh-weixin#<commit>
-dsh plugin --profile web add dsh-weixin
+dsh plugin --profile web add github:caoyilearnai/dsh-weixin
 ```
 
-启动（与平时一致，插件会随 web 组合自动加载）：
+**2. 启动**（与平时启动 Harness 一致，插件随 web 组合自动加载）：
 
 ```sh
 dsh web --port 3080
 ```
 
-验证：
+**3. 扫码登录**：
+
+手机微信先开通 ClawBot（「设置 → 插件 → ClawBot」，iOS ≥ 8.0.70），然后打开
+`http://127.0.0.1:3080/weixin` → 点「扫码登录」→ 手机微信扫码（若提示数字验证码，照输即可）。
+
+**4. 开始对话**：微信里给机器人发消息即可，每个微信用户自动对应一个独立会话。
+
+登录凭据会写入状态目录，重启后免扫码。
+
+> 卸载：`dsh plugin --profile web remove dsh-weixin`
+
+### 其它安装方式
 
 ```sh
-dsh web --dump-config          # 应看到 # == dsh-weixin 层
-curl http://127.0.0.1:3080/weixin/status
+# 本地目录
+dsh plugin --profile web add /path/to/dsh-weixin
+# npm（发布后）
+dsh plugin --profile web add dsh-weixin
+# 锁定 commit（更稳）
+dsh plugin --profile web add github:caoyilearnai/dsh-weixin#<sha>
 ```
 
-卸载：
+### 命令行扫码登录（可选）
+
+不用面板也可以用 CLI 登录：
 
 ```sh
-dsh plugin --profile web remove dsh-weixin
+dsh-weixin-login
+# 或：node node_modules/dsh-weixin/bin/login.mjs
 ```
-
-## 登录
-
-手机端前置：微信「设置 → 插件 → ClawBot」（iOS ≥ 8.0.70；安卓灰度中，以微信实际为准）。
-
-1. **面板**（推荐）：打开 `http://127.0.0.1:3080/weixin` → 「扫码登录」→ 必要时输入手机端数字验证码。
-2. **CLI**：`dsh-weixin-login [stateDir]`（或 `node node_modules/dsh-weixin/bin/login.mjs`）。
-
-登录后的凭据写入状态目录（见下），重启后自动读取，无需重新扫码。
 
 ## 主动推送
 
@@ -66,7 +72,7 @@ dsh plugin --profile web remove dsh-weixin
 ```js
 export const inject = ['weixin']
 export function apply(ctx) {
-  ctx.weixin.push('o9cq...@im.wechat', '你好')  // 推给单个微信用户
+  ctx.weixin.push('your-user@im.wechat', '你好')  // 推给单个微信用户
   ctx.weixin.sendAll('全员通知')                 // 广播给所有已建会话用户
   ctx.weixin.status()                            // 连接状态快照
   ctx.weixin.sessions()                          // 用户 id → sessionId 映射
@@ -78,7 +84,7 @@ export function apply(ctx) {
 ```sh
 curl -X POST http://127.0.0.1:3080/weixin/send \
   -H 'content-type: application/json' \
-  -d '{"to":"o9cq...@im.wechat","text":"你好"}'
+  -d '{"to":"your-user@im.wechat","text":"你好"}'
 # 广播：{"to":"all", "text":"..."}
 ```
 
