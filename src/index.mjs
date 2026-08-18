@@ -77,13 +77,22 @@ export class WeixinChannel {
     this.store = store
     this.log = ctx.logger ?? console
     this.creds = store.loadCredentials()
-    this.sessionMap = store.loadSessionMap()
+    // 多会话映射：{ userId: { active, sessions: [{id, name, provider, model, createdAt, lastActiveAt}] } }
+    const loaded = store.loadSessionMap()
+    this.sessionMap = loaded.map ?? loaded
+    if (loaded.migrated) {
+      this.store.saveSessionMap(this.sessionMap)
+      this.log.info?.('dsh-weixin: 会话映射已升级为多会话格式')
+    }
     this.buf = store.loadBuf()
     this.botAgent = 'DeepSeek Harness Weixin Channel'
     this.typingTickets = new Map()
     this.turns = new Map() // sessionId -> current turn
     this.pending = new Map() // userMessage.id -> {from, contextToken, sessionId, resolve, timer}
-    this.collector = null // { sessionId, turn, msgId, parts, pending }
+    this.collectors = new Map() // userMessage.id -> { sessionId, turn, msgId, parts, pending }（多会话并发各自收集）
+    this.handles = new Map() // sessionId -> AgentHandle（dispose 用）
+    this.modelSelections = new Map() // sessionId -> ModelSelectionRef（每会话可变模型选择）
+    this.userQueues = new Map() // userId -> Promise（同一用户的消息串行处理，不同用户并行）
     this.lastSendAt = 0
     this.sendQueue = Promise.resolve() // 发送调速队列（review S6）
     this.stopped = false
@@ -94,6 +103,7 @@ export class WeixinChannel {
     this.login = null // 面板登录流程状态
     this.downloadImageBytes = ilink.downloadImageBytes // 测试注入点（默认走 CDN 下载解密）
     this.visionCache = new Map() // `provider:model` -> boolean（模型是否支持图片输入）
+    this.showTag = true // 回复末尾是否带当前会话标记（/tag on|off 切换）
 
     this.ctx.on('session/event', (session, event) => this.handleSessionEvent(session, event))
     this.ctx.on('dispose', () => this.stop())
@@ -143,7 +153,9 @@ export class WeixinChannel {
         }
         for (const msg of ilink.normalizeInboundMessages(resp)) {
           if (this.stopped || aborter.signal.aborted) break
-          await this.handleInbound(msg)
+          // 非阻塞派发：同一用户的消息经 per-user 队列串行（保序 + 防 ensureAgentFor 竞态），
+          // 不同用户/不同会话的 turn 并行推进，不再整轮阻塞长轮询循环。
+          this.dispatchInbound(msg)
         }
       } catch (err) {
         failures += 1
@@ -153,6 +165,16 @@ export class WeixinChannel {
         await sleep(wait)
       }
     }
+  }
+
+  /** 入站消息按用户排队派发（不 await；错误只记日志，不影响长轮询）。 */
+  dispatchInbound(msg) {
+    const userId = msg?.from ?? ''
+    const prev = this.userQueues.get(userId) ?? Promise.resolve()
+    const next = prev.then(() => this.handleInbound(msg)).catch((err) => {
+      this.pushLog(`消息处理异常：${err?.message ?? err}`)
+    })
+    this.userQueues.set(userId, next)
   }
 
   async stop() {
@@ -197,9 +219,52 @@ export class WeixinChannel {
 
   /* ------------------------------ 会话/代理 ------------------------------ */
 
-  async composeSetup() {
+  /** 内联实现 @deepseek-ai/dsh-agent 的 installModelSelection（30 行等价逻辑），
+   *  避免 fork 后新增包依赖。把可变 ModelSelectionRef 挂到 agent 作用域的
+   *  prompt 组装与请求路由上：切换模型在下一个 step 生效，会话历史保留。 */
+  installModelSelection(agentCtx, selection) {
+    const disposeAssembly = agentCtx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+      const selected = selection.current
+      const assembled = await next()
+      selection.assembled = selected
+      if (selected === undefined) return assembled
+      return { ...assembled, variables: { ...assembled.variables, provider: selected.provider, model: selected.model } }
+    })
+    const disposeRequest = agentCtx.on('agent/request', async (_payload, next) => {
+      const resolved = await next()
+      const selected = selection.assembled
+      if (selected === undefined) return resolved
+      const { reasoningEffort: _inherited, ...rest } = resolved
+      return { ...rest, provider: selected.provider, model: selected.model, ...selected.reasoningEffort === void 0 ? {} : { reasoningEffort: selected.reasoningEffort } }
+    })
+    return () => { disposeAssembly(); disposeRequest() }
+  }
+
+  /** 取（或创建）某会话的模型选择 ref。create/resume 时经 setup 闭包安装到 agent 作用域。 */
+  modelSelectionFor(sessionId, entry) {
+    let ref = this.modelSelections.get(sessionId)
+    if (!ref) {
+      ref = {
+        current: entry?.provider && entry?.model ? { provider: entry.provider, model: entry.model } : undefined,
+        assembled: undefined,
+      }
+      this.modelSelections.set(sessionId, ref)
+    }
+    return ref
+  }
+
+  async composeSetup(sessionId, entry) {
     const presets = this.ctx.get('agentPresets')
+    const selection = sessionId ? this.modelSelectionFor(sessionId, entry) : null
     return async (agentCtx) => {
+      // 每会话模型选择：ref.current 有值时覆盖 prompt 变量与实际请求路由
+      if (selection) {
+        try {
+          this.installModelSelection(agentCtx, selection)
+        } catch (err) {
+          this.pushLog(`安装模型选择失败：${err?.message ?? err}`)
+        }
+      }
       // 通道指令：注册到 agent 作用域，只约束本微信会话、不污染网页端。
       // 关键：禁止 ask_user_question（它走网页 provider，微信端无法应答会卡住整轮）。
       try {
@@ -235,38 +300,326 @@ export class WeixinChannel {
     return {}
   }
 
-  /** 微信用户 → 会话/代理。已有则复用；持久化会话则恢复；否则新建。 */
+  /** 取用户记录；不存在则返回 null（不自动创建，创建走 createSessionFor）。 */
+  userRecord(userId) {
+    return this.sessionMap[userId] ?? null
+  }
+
+  /** 用户当前会话 entry；无记录时返回 null。 */
+  activeEntry(userId) {
+    const rec = this.userRecord(userId)
+    if (!rec) return null
+    return rec.sessions.find((s) => s.id === rec.active) ?? rec.sessions[0] ?? null
+  }
+
+  /** entry 记忆的模型 → AgentOptions；无记忆则回落全局默认模型。 */
+  resolveAgentOptionsFor(entry) {
+    if (entry?.provider && entry?.model) return { provider: entry.provider, model: entry.model }
+    return this.resolveDefaultAgentOptions()
+  }
+
+  /** 为用户新建会话并设为当前。@returns {{agent, entry}} */
+  async createSessionFor(userId, name) {
+    const newId = `session-${randomUUID()}`
+    const now = new Date().toISOString()
+    const entry = {
+      id: newId,
+      name: name?.trim() || `会话 ${(this.sessionMap[userId]?.sessions.length ?? 0) + 1}`,
+      provider: null,
+      model: null,
+      createdAt: now,
+      lastActiveAt: now,
+    }
+    const { agent, dispose } = await this.ctx.agents.create({
+      sessionId: newId,
+      agentOptions: this.resolveAgentOptionsFor(entry),
+      meta: { cwd: this.cfg.cwd },
+      setup: await this.composeSetup(newId, entry),
+    })
+    this.handles.set(newId, { agent, dispose })
+    const rec = this.sessionMap[userId] ?? { active: newId, sessions: [] }
+    rec.sessions.push(entry)
+    rec.active = newId
+    this.sessionMap[userId] = rec
+    this.store.saveSessionMap(this.sessionMap)
+    this.pushLog(`为 ${userId.slice(0, 12)}… 新建会话 ${newId}（${entry.name}）`)
+    return { agent, entry }
+  }
+
+  /** 加载指定 entry 对应的 agent：活着复用，否则从持久化恢复。 */
+  async loadAgentFor(entry) {
+    const live = this.ctx.agents.get(entry.id)
+    if (live) return live
+    const handle = await this.ctx.agents.resume({
+      resumeSessionId: entry.id,
+      agentOptions: this.resolveAgentOptionsFor(entry),
+      setup: await this.composeSetup(entry.id, entry),
+    })
+    this.handles.set(entry.id, handle)
+    this.pushLog(`恢复持久化会话 ${entry.id}（${entry.name}）`)
+    return handle.agent
+  }
+
+  /** 微信用户 → 当前会话的代理。无记录则新建首个会话。 */
   async ensureAgentFor(userId) {
-    const sessionId = this.sessionMap[userId]
-    if (sessionId) {
-      const live = this.ctx.agents.get(sessionId)
-      if (live) return live
+    let entry = this.activeEntry(userId)
+    if (!entry) return (await this.createSessionFor(userId)).agent
+    try {
+      return await this.loadAgentFor(entry)
+    } catch (err) {
+      this.pushLog(`恢复会话 ${entry.id} 失败：${err?.message ?? err}，将新建`)
+      return (await this.createSessionFor(userId)).agent
+    }
+  }
+
+  /* ------------------------------ 斜杠命令 ------------------------------ */
+
+  /** 命令帮助文本。 */
+  helpText() {
+    return [
+      '📖 会话操作：',
+      '/new [名称] — 新建会话并切换过去',
+      '/list — 列出我的全部会话（或发「列表」）',
+      '/2 — 快捷切换到 2 号会话',
+      '#名称 内容 — 直接向指定会话说话（如 #工作 帮我写周报）',
+      '/model — 列出可用模型（或发「模型」）',
+      '/model <编号> — 给当前会话切换模型',
+      '/rename <名称> — 重命名当前会话',
+      '/del <编号> — 删除指定会话',
+      '/tag on|off — 回复末尾是否带当前会话标记',
+      '/help — 本帮助（或发「帮助」）',
+      '直接发文字/语音即与当前会话对话。',
+    ].join('\n')
+  }
+
+  /** 会话列表文本，当前会话打 ✅。 */
+  sessionListText(userId) {
+    const rec = this.userRecord(userId)
+    if (!rec?.sessions.length) return '你还没有会话，发 /new 新建一个吧'
+    const lines = rec.sessions.map((s, i) => {
+      const mark = s.id === rec.active ? '✅ ' : ''
+      const model = s.provider && s.model ? `${s.provider}/${s.model}` : '默认模型'
+      return `${mark}${i + 1}. ${s.name}（${model}）`
+    })
+    return ['💬 我的会话：', ...lines, '', '发 /数字 快速切换；#名称 内容 直接向指定会话说话'].join('\n')
+  }
+
+  /** 拉取可用模型目录：[{provider, model}]，按 provider 分组摊平编号。 */
+  async listAvailableModels() {
+    const llm = this.ctx.get?.('llm')
+    if (!llm) return []
+    const out = []
+    for (const provider of llm.listProviders()) {
       try {
-        const { agent } = await this.ctx.agents.resume({
-          resumeSessionId: sessionId, agentOptions: this.resolveDefaultAgentOptions(), setup: await this.composeSetup(),
-        })
-        this.pushLog(`恢复持久化会话 ${sessionId}（${userId.slice(0, 12)}…）`)
-        return agent
+        const models = await llm.listModels(provider)
+        for (const m of models ?? []) {
+          const id = typeof m === 'string' ? m : m?.id ?? m?.model
+          if (id) out.push({ provider, model: id })
+        }
       } catch (err) {
-        this.pushLog(`恢复会话 ${sessionId} 失败：${err?.message ?? err}，将新建`)
+        this.pushLog(`列出 ${provider} 模型失败：${err?.message ?? err}`)
       }
     }
+    return out
+  }
 
-    const newId = `session-${randomUUID()}`
-    try {
-      const { agent } = await this.ctx.agents.create({
-        sessionId: newId,
-        agentOptions: this.resolveDefaultAgentOptions(),
-        meta: { cwd: this.cfg.cwd },
-        setup: await this.composeSetup(),
-      })
-      this.sessionMap[userId] = newId
-      this.store.saveSessionMap(this.sessionMap)
-      this.pushLog(`为 ${userId.slice(0, 12)}… 新建会话 ${newId}`)
-      return agent
-    } catch (err) {
-      this.pushLog(`新建会话失败：${err?.message ?? err}`)
-      throw err
+  /** 模型列表文本，当前会话所用模型打 ✅。 */
+  async modelListText(userId) {
+    const models = await this.listAvailableModels()
+    if (!models.length) return '暂时查不到可用模型（llm 服务不可用）'
+    const entry = this.activeEntry(userId)
+    const lines = models.map((m, i) => {
+      const mark = entry?.provider === m.provider && entry?.model === m.model ? '✅ ' : ''
+      return `${mark}${i + 1}. ${m.provider}/${m.model}`
+    })
+    return ['🧠 可用模型：', ...lines, '', '发 /model <编号> 给当前会话换模型'].join('\n')
+  }
+
+  /** 按编号或名称解析用户的会话 entry（/# 定向与快捷切换共用）。 */
+  resolveSessionRef(userId, ref) {
+    const rec = this.userRecord(userId)
+    if (!rec?.sessions.length) return null
+    const n = Number.parseInt(ref, 10)
+    if (Number.isFinite(n) && String(n) === ref.trim()) return rec.sessions[n - 1] ?? null
+    return rec.sessions.find((s) => s.name === ref.trim()) ?? null
+  }
+
+  /** 切换用户的当前会话（不落 agent，仅改映射）。 */
+  switchActive(userId, entry) {
+    const rec = this.userRecord(userId)
+    if (!rec) return
+    rec.active = entry.id
+    entry.lastActiveAt = new Date().toISOString()
+    this.store.saveSessionMap(this.sessionMap)
+  }
+
+  /** 回复末尾的会话标记（💬「名称」· provider/model）。showTag 为 false 时返回空串。 */
+  sessionTagFor(sessionId) {
+    if (!this.showTag) return ''
+    for (const rec of Object.values(this.sessionMap)) {
+      const s = rec.sessions?.find?.((x) => x.id === sessionId)
+      if (s) {
+        const model = s.provider && s.model ? `${s.provider}/${s.model}` : '默认模型'
+        return `\n——💬「${s.name}」· ${model}`
+      }
+    }
+    return ''
+  }
+
+  /**
+   * 斜杠命令分发。命中命令则处理并回复，返回 true；
+   * 未命中（如语音误转写出 /xxx）返回 false，调用方按普通消息继续处理。
+   */
+  async handleCommand(from, contextToken, text) {
+    // 快捷切换：/2 等价 /use 2
+    const quick = text.match(/^\/(\d{1,3})$/)
+    if (quick) {
+      const rec = this.userRecord(from)
+      const entry = rec?.sessions[Number(quick[1]) - 1]
+      if (!entry) {
+        await this.sendReply(from, contextToken, `编号无效（共 ${rec?.sessions.length ?? 0} 个会话），发 /list 查看`)
+        return true
+      }
+      this.switchActive(from, entry)
+      const model = entry.provider && entry.model ? `${entry.provider}/${entry.model}` : '默认模型'
+      await this.sendReply(from, contextToken, `🔀 已切换到「${entry.name}」（${model}），历史上下文都在`)
+      return true
+    }
+    const m = text.match(/^\/([a-z]+)\s*([\s\S]*)$/i)
+    if (!m) return false
+    const cmd = m[1].toLowerCase()
+    const arg = (m[2] ?? '').trim()
+
+    switch (cmd) {
+      case 'help':
+        await this.sendReply(from, contextToken, this.helpText())
+        return true
+
+      case 'list':
+        await this.sendReply(from, contextToken, this.sessionListText(from))
+        return true
+
+      case 'new': {
+        try {
+          const { entry } = await this.createSessionFor(from, arg)
+          await this.sendReply(from, contextToken, `✨ 已新建并切换到「${entry.name}」，直接发消息开始对话吧`)
+        } catch (err) {
+          await this.sendReply(from, contextToken, `😵 新建会话失败：${err?.message ?? err}`)
+        }
+        return true
+      }
+
+      case 'use': {
+        const rec = this.userRecord(from)
+        const n = Number.parseInt(arg, 10)
+        if (!rec?.sessions.length) {
+          await this.sendReply(from, contextToken, '你还没有会话，发 /new 新建一个吧')
+          return true
+        }
+        const entry = rec.sessions[n - 1]
+        if (!entry) {
+          await this.sendReply(from, contextToken, `编号无效（共 ${rec.sessions.length} 个会话），发 /list 查看`)
+          return true
+        }
+        this.switchActive(from, entry)
+        const model = entry.provider && entry.model ? `${entry.provider}/${entry.model}` : '默认模型'
+        await this.sendReply(from, contextToken, `🔀 已切换到「${entry.name}」（${model}），历史上下文都在`)
+        return true
+      }
+
+      case 'tag': {
+        this.showTag = arg !== 'off'
+        await this.sendReply(from, contextToken, this.showTag ? '🏷️ 回复末尾将显示当前会话标记' : '🏷️ 已关闭会话标记')
+        return true
+      }
+
+      case 'model': {
+        if (!arg) {
+          await this.sendReply(from, contextToken, await this.modelListText(from))
+          return true
+        }
+        const n = Number.parseInt(arg, 10)
+        const models = await this.listAvailableModels()
+        const picked = models[n - 1]
+        if (!picked) {
+          await this.sendReply(from, contextToken, `编号无效（共 ${models.length} 个模型），发 /model 查看`)
+          return true
+        }
+        const rec = this.userRecord(from)
+        const entry = this.activeEntry(from)
+        if (!rec || !entry) {
+          await this.sendReply(from, contextToken, '你还没有会话，发 /new 新建一个吧')
+          return true
+        }
+        entry.provider = picked.provider
+        entry.model = picked.model
+        this.store.saveSessionMap(this.sessionMap)
+        // live 会话：直接改模型选择 ref，下一 step 生效（不 dispose，历史不断）
+        const ref = this.modelSelections.get(entry.id)
+        if (ref) ref.current = { provider: picked.provider, model: picked.model }
+        this.visionCache.clear() // 模型变了，视觉能力缓存作废
+        await this.sendReply(from, contextToken, `🧠 当前会话「${entry.name}」已切换模型：${picked.provider}/${picked.model}\n（历史对话保留，从下一条消息起生效）`)
+        return true
+      }
+
+      case 'rename': {
+        const entry = this.activeEntry(from)
+        if (!entry) {
+          await this.sendReply(from, contextToken, '你还没有会话，发 /new 新建一个吧')
+          return true
+        }
+        if (!arg) {
+          await this.sendReply(from, contextToken, '用法：/rename <新名称>')
+          return true
+        }
+        entry.name = arg
+        this.store.saveSessionMap(this.sessionMap)
+        // 同步到 harness 会话标题（web 端可见）；服务缺失时只改本地名
+        try {
+          const agent = this.ctx.agents.get(entry.id)
+          const titles = this.ctx.get?.('sessionTitle')
+          if (agent && titles?.rename) await titles.rename(agent.session, arg)
+        } catch (err) {
+          this.pushLog(`同步会话标题失败：${err?.message ?? err}`)
+        }
+        await this.sendReply(from, contextToken, `✏️ 当前会话已改名为「${arg}」`)
+        return true
+      }
+
+      case 'del': {
+        const rec = this.userRecord(from)
+        const n = Number.parseInt(arg, 10)
+        if (!rec?.sessions.length) {
+          await this.sendReply(from, contextToken, '你还没有会话可删')
+          return true
+        }
+        const idx = n - 1
+        const entry = rec.sessions[idx]
+        if (!entry) {
+          await this.sendReply(from, contextToken, `编号无效（共 ${rec.sessions.length} 个会话），发 /list 查看`)
+          return true
+        }
+        // 停掉 live agent 并清理本插件侧状态；harness 持久化数据保留（仅解除映射）
+        try {
+          const handle = this.handles.get(entry.id)
+          if (handle) await handle.dispose()
+        } catch (err) {
+          this.pushLog(`dispose 会话 ${entry.id} 失败：${err?.message ?? err}`)
+        }
+        this.handles.delete(entry.id)
+        this.modelSelections.delete(entry.id)
+        rec.sessions.splice(idx, 1)
+        if (rec.active === entry.id) rec.active = rec.sessions[0]?.id ?? null
+        if (!rec.sessions.length) delete this.sessionMap[from]
+        this.store.saveSessionMap(this.sessionMap)
+        const next = this.activeEntry(from)
+        const tail = next ? `已切到「${next.name}」` : '会话已清空，发 /new 新建'
+        await this.sendReply(from, contextToken, `🗑️ 已删除「${entry.name}」。${tail}`)
+        return true
+      }
+
+      default:
+        return false // 未知命令不吞消息，按普通消息走模型
     }
   }
 
@@ -284,6 +637,35 @@ export class WeixinChannel {
       return
     }
     this.pushLog(`收：${from.slice(0, 12)}… ${(bodyText || '[图片]').slice(0, 60)}`)
+
+    // # 定向发言：#名称 内容 或 #2 内容——先切到目标会话再继续正常消息流。
+    // 目标匹配不到会话时按普通消息处理（不误吞 # 开头的聊天内容）。
+    if (bodyText.startsWith('#')) {
+      const hm = bodyText.match(/^#(\S+)([\s\S]*)$/)
+      const target = hm ? this.resolveSessionRef(from, hm[1]) : null
+      if (target) {
+        this.switchActive(from, target)
+        const rest = (hm[2] ?? '').trim()
+        if (!rest && !hasImage) {
+          const model = target.provider && target.model ? `${target.provider}/${target.model}` : '默认模型'
+          await this.sendReply(from, contextToken, `🔀 已切换到「${target.name}」（${model}）`)
+          return
+        }
+        if (rest) {
+          this.pushLog(`定向：${from.slice(0, 12)}… → 「${target.name}」`)
+          // 递归走正常消息流（rest 已剥离 # 前缀；不会无限递归：命令/定向分支对 rest 重新判定）
+          return this.handleInbound({ ...msg, text: rest, voiceText: undefined })
+        }
+      }
+    }
+
+    // 中文关键词快捷命令（全消息精确匹配，避免误伤正常聊天）
+    const CN_CMD = { '列表': '/list', '会话列表': '/list', '帮助': '/help', '模型': '/model', '换模型': '/model' }
+    if (CN_CMD[bodyText] && await this.handleCommand(from, contextToken, CN_CMD[bodyText])) return
+
+    // 斜杠命令：/new /list /use /model /rename /del /help、/数字 快捷切换。
+    // 命中则直接处理（不进模型、不发 typing）；未命中按普通消息继续。
+    if (bodyText.startsWith('/') && await this.handleCommand(from, contextToken, bodyText)) return
 
     // 正在输入提示；发送失败视为 ticket 可能已失效，清缓存下次重建（review S12）
     const ticket = await this.getTypingTicket(from, contextToken)
@@ -304,7 +686,7 @@ export class WeixinChannel {
     // 导致后续每一轮都把图片重发给纯文本模型 → 每次都报错 → 整段会话「发什么都没反应」。
     let imageBlock = null
     if (hasImage) {
-      if (await this.supportsVision(agent?.options)) {
+      if (await this.supportsVision(this.currentSelectionFor(agent))) {
         if (this.ctx.attachments) imageBlock = await this.resolveImageBlock(msg.image)
       } else if (!bodyText) {
         // 纯图片 + 模型不看图：不注入、不跑模型，直接友好提示，避免污染历史
@@ -328,6 +710,7 @@ export class WeixinChannel {
       const pend = { from, contextToken, sessionId: agent.id, resolve, timer: null, typingStopped: false }
       const timer = setTimeout(() => {
         this.pending.delete(userMessage.id)
+        this.collectors.delete(userMessage.id)
         this.stopTypingOnce(pend)
         this.sendReply(from, contextToken, '⏰ 处理超时，请稍后再试').finally(resolve)
       }, this.cfg.replyTimeoutMs)
@@ -346,18 +729,26 @@ export class WeixinChannel {
     })
   }
 
+  /** 会话当前生效的模型选择：live ref 优先，其次 agent.options，再其次全局默认。
+   *  供视觉检测等需要“当前模型”的场景使用。 */
+  currentSelectionFor(agent) {
+    const ref = agent?.id ? this.modelSelections.get(agent.id) : null
+    if (ref?.current) return ref.current
+    return agent?.options ?? {}
+  }
+
   /**
    * 判断会话所用模型是否支持图片输入（保守：无法判断/查不到一律视为不支持）。
    * 结果按 `provider:model` 缓存，避免每张图都请求模型元数据。
    */
-  async supportsVision(agentOptions) {
+  async supportsVision(selection) {
     try {
       const llm = this.ctx.get?.('llm')
       const am = this.ctx.get?.('agentDefaultModel')
       if (!llm) return false
       const sel = am?.currentSelection?.() ?? {}
-      const provider = agentOptions?.provider || sel.provider
-      const model = agentOptions?.model || sel.model
+      const provider = selection?.provider || sel.provider
+      const model = selection?.model || sel.model
       if (!provider || !model) return false
       const key = `${provider}:${model}`
       if (this.visionCache.has(key)) return this.visionCache.get(key)
@@ -437,13 +828,13 @@ export class WeixinChannel {
         const msgId = event.data?.id
         const pend = this.pending.get(msgId)
         if (pend) {
-          this.collector = { sessionId, turn: this.turns.get(sessionId), msgId, parts: [], pending: pend }
+          this.collectors.set(msgId, { sessionId, turn: this.turns.get(sessionId), msgId, parts: [], pending: pend })
         }
         break
       }
       case 'assistant/message': {
-        const c = this.collector
-        if (!c || c.sessionId !== sessionId || event.data?.turn !== c.turn) break
+        const c = this.collectorFor(sessionId, event.data?.turn)
+        if (!c) break
         const blocks = event.data?.message?.content ?? []
         const texts = blocks.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text)
         if (texts.length) {
@@ -453,9 +844,9 @@ export class WeixinChannel {
         break
       }
       case 'turn/end': {
-        const c = this.collector
-        if (!c || c.sessionId !== sessionId || event.data?.turn !== c.turn) break
-        this.collector = null
+        const c = this.collectorFor(sessionId, event.data?.turn)
+        if (!c) break
+        this.collectors.delete(c.msgId)
         const { pending, parts, msgId } = c
         // 已超时：pending 已被超时分支移除，说明「处理超时」已发出，勿重复发送完整回复（review I1）
         if (!this.pending.has(msgId)) {
@@ -478,7 +869,7 @@ export class WeixinChannel {
             : `😵 处理失败：${emsg || '未知错误'}`
         }
         const send = outText
-          ? this.sendReply(pending.from, pending.contextToken, outText)
+          ? this.sendReply(pending.from, pending.contextToken, outText + this.sessionTagFor(sessionId))
           : Promise.resolve()
         send.finally(() => {
           this.stopTypingOnce(pending) // 轮次结束取消输入指示（review S12）
@@ -489,6 +880,14 @@ export class WeixinChannel {
       default:
         break
     }
+  }
+
+  /** 按 sessionId + turn 找到对应的消息收集器（多会话并发时各自独立）。 */
+  collectorFor(sessionId, turn) {
+    for (const c of this.collectors.values()) {
+      if (c.sessionId === sessionId && c.turn === turn) return c
+    }
+    return null
   }
 
   /* ------------------------------ 发送 ------------------------------ */
@@ -637,7 +1036,8 @@ export function registerPushTool(ctx, channel) {
       if (!to) {
         // 缺省时优先发给触发本工具的会话所属微信用户（schedule 到点醒来正好对应该用户），否则广播
         const sid = exec?.agent?.id
-        const owner = sid ? Object.keys(channel.sessionMap).find((u) => channel.sessionMap[u] === sid) : undefined
+        // 多会话结构：命中任一「当前会话」为该 sessionId 的用户
+        const owner = sid ? Object.keys(channel.sessionMap).find((u) => channel.sessionMap[u]?.active === sid) : undefined
         to = owner || 'all'
       }
       return channel.push(to, String(args.text ?? ''))

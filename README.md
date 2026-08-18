@@ -1,4 +1,24 @@
-# dsh-weixin
+# dsh-weixin（社区增强 fork · 多会话版）
+
+> 本仓库是 [`caoyilearnai/dsh-weixin`](https://github.com/caoyilearnai/dsh-weixin) `v0.2.1` 的社区增强 fork。
+> 安装方式：`dsh plugin --profile web add github:tangwenhao616-netizen/dsh-weixin`
+>
+> 与上游 npm 版的差异：
+>
+> 1. **多会话**：一个微信用户可拥有多个会话（`session-map.json` 从 1:1 映射升级为
+>    `{ active, sessions: [{id, name, provider, model, createdAt, lastActiveAt}] }`，旧格式自动迁移）。
+> 2. **斜杠命令**：`/help` `/new [名称]` `/list` `/use <n>` `/model [n]` `/rename <名称>` `/del <n>`。
+> 3. **每会话模型**：模型选择记入映射，`create/resume` 时经 `agentOptions` 生效；
+>    live 会话通过内联的 installModelSelection 等效逻辑（`system-prompt/assemble` +
+>    `agent/request` 两个 waterfall）在下一 step 切换，不污染全局默认模型。
+> 4. **并发修复**：回复收集器从全局单槽改为按 msgId 索引的 Map（多会话并行互不覆盖）；
+>    入站消息按用户排队派发（同一用户串行保序，不同用户/会话并行），长轮询不再整轮阻塞。
+>
+> 测试：`node --test 'test/*.test.mjs'`（51 个用例）。
+
+---
+
+# 上游 README（dsh-weixin@0.2.1）dsh-weixin
 
 微信 ClawBot（iLink）通道插件：把微信消息接入 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 会话。
 
@@ -161,12 +181,13 @@ dsh-weixin/
 | 图片 | ⚠️ 能接收（CDN 下载 → AES 解密 → 存附件），但**当前 DeepSeek V4 是纯文本模型，看不了图**：会回复「不支持看图」，且不污染会话历史（后续文字不受影响）。接入视觉模型后自动看图 |
 | 文件 / 视频 / 其它 | ❌ 暂不支持，回复「暂不支持」 |
 
-## 已知限制
+## 已知限制（本地 fork 已改善项已标注）
 
 - **仅单聊**：群聊未适配（回包始终发给发消息的个人）。
 - **扫码登录 5 分钟超时**：二维码 5 分钟内有效，过期最多自动刷新 3 次，仍超时需重新发起登录。
-- **单轮串行**：一条微信消息会阻塞整个通道直到该轮结束，多用户场景后面的消息会排队等待（单用户无感）。
-- **无内置"清空上下文"入口**：如需重开会话，删除状态目录下的 `session-map.json`（见「状态目录」），下次消息会新建会话。
+- ✅ **多用户/多会话并发**：本地 fork 已改为 per-user 队列 + collector Map，不同用户/不同会话的 turn 可并行；同一微信用户下的多个会话也可以并行跑 turn。
+- ✅ **内置清空/删除入口**：`/del <编号>` 可删除指定会话；`/new` 可新建会话。
+- ✅ **单窗口内多会话**：受 ClawBot 限制，一个微信号只能有一个机器人窗口，因此所有会话仍共用该窗口，通过 `/list`、`/2`、`#名称 内容` 等方式快速切换/定向发言。
 - iLink 限流（`ret=-2`）已内置指数退避重试；连发仍可能被腾讯节流。
 - ClawBot 处于灰度测试阶段，腾讯保留调整权利。
 
