@@ -337,13 +337,18 @@ function render(s) {
   tbl.replaceChildren();
   {
     const tr = tbl.insertRow(), th1 = document.createElement('th'), th2 = document.createElement('th');
-    th1.textContent = '微信用户'; th2.textContent = '会话';
+    th1.textContent = '微信用户'; th2.textContent = '会话（✅ = 当前）';
     tr.append(th1, th2);
   }
   if (rows.length) {
-    for (const [u, sid] of rows) {
+    for (const [u, rec] of rows) {
+      // 多会话结构：rec = { active, sessions: [{id, name, provider, model}] }
+      const sessions = Array.isArray(rec?.sessions) ? rec.sessions : [];
+      const text = sessions.length
+        ? sessions.map((x) => (x.id === rec.active ? '✅ ' : '') + (x.name || x.id) + (x.provider && x.model ? ' [' + x.provider + '/' + x.model + ']' : '')).join('\n')
+        : String(rec);
       const tr = tbl.insertRow(), td1 = document.createElement('td'), td2 = document.createElement('td');
-      td1.textContent = u.slice(0, 18) + '…'; td2.textContent = sid;
+      td1.textContent = u.slice(0, 18) + '…'; td2.textContent = text;
       tr.append(td1, td2);
     }
   } else {

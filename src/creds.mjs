@@ -38,6 +38,32 @@ function saveJson(file, data) {
   fs.renameSync(tmp, file)
 }
 
+/**
+ * 会话映射多会话格式迁移：
+ *   旧版 { userId: "session-xxx" }
+ *   新版 { userId: { active, sessions: [{ id, name, provider, model, createdAt, lastActiveAt }] } }
+ * provider/model 为该会话记忆的模型选择；null 表示跟随默认/会话日志。
+ */
+export function migrateSessionMap(raw) {
+  const out = {}
+  let changed = false
+  for (const [userId, value] of Object.entries(raw ?? {})) {
+    if (typeof value === 'string') {
+      changed = true
+      const now = new Date().toISOString()
+      out[userId] = {
+        active: value,
+        sessions: [{ id: value, name: '默认', provider: null, model: null, createdAt: now, lastActiveAt: now }],
+      }
+    } else if (value && Array.isArray(value.sessions)) {
+      out[userId] = value
+    } else {
+      changed = true // 无法识别的条目直接丢弃，避免污染新格式
+    }
+  }
+  return { map: out, migrated: changed }
+}
+
 /** 以 stateDir 为根创建状态存储。 */
 export function createStore(stateDir) {
   const dir = path.resolve(stateDir)
@@ -49,7 +75,8 @@ export function createStore(stateDir) {
     dir,
     loadCredentials: () => loadJson(credFile, null),
     saveCredentials: (cred) => saveJson(credFile, cred),
-    loadSessionMap: () => loadJson(sessionMapFile, {}),
+    // 加载时自动把旧版 1:1 映射升级为多会话结构（migrated 为 true 时调用方应立刻写回）
+    loadSessionMap: () => migrateSessionMap(loadJson(sessionMapFile, {})),
     saveSessionMap: (map) => saveJson(sessionMapFile, map),
     loadBuf: () => {
       const d = loadJson(bufFile, null)

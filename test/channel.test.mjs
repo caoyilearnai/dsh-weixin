@@ -64,7 +64,7 @@ test('整轮助手文本合并回复，并正确关联用户', async () => {
   assert.equal(ch.sent[0].to, FROM)
   assert.equal(ch.sent[0].text, '我先查一下…\n最终回复内容')
   assert.equal(ch.pending.has(msgId), false)
-  assert.equal(ch.collector, null)
+  assert.equal(ch.collectors.size, 0)
 })
 
 test('错误会话的事件不触发回复，也不清理 pending', async () => {
@@ -159,19 +159,19 @@ test('超时后 turn/end 不重复发送（review I1）', async () => {
   const ch = makeChannel()
   let resolved = false
   // 模拟超时已发生：pending 已从 map 移除，collector 仍残留旧引用
-  ch.collector = {
+  ch.collectors.set('msg-timeout', {
     sessionId: SESSION,
     turn: 9,
     msgId: 'msg-timeout',
     parts: ['迟到的完整回复'],
     pending: { from: FROM, contextToken: 'tok', resolve: () => { resolved = true }, timer: null },
-  }
+  })
   ch.handleSessionEvent({ id: SESSION }, { type: 'turn/end', data: { turn: 9 } })
   await tick()
 
   assert.equal(ch.sent.length, 0) // 不重复发送完整回复
   assert.equal(resolved, true)    // 仍 resolve，避免 handleInbound 悬挂
-  assert.equal(ch.collector, null)
+  assert.equal(ch.collectors.size, 0)
 })
 
 test('turn/end 模型报错且无助手文本：图片不支持 → 回明确提示而非静默', async () => {
@@ -486,7 +486,10 @@ test('registerPushTool 注册 push_weixin：缺省发给会话所属用户，显
   const calls = []
   const ctx = { tools: { register: (d) => { registered.push(d); return () => {} } } }
   const channel = {
-    sessionMap: { 'u1@im.wechat': 'session-A', 'u2@im.wechat': 'session-B' },
+    sessionMap: {
+      'u1@im.wechat': { active: 'session-A', sessions: [{ id: 'session-A', name: 'A' }] },
+      'u2@im.wechat': { active: 'session-B', sessions: [{ id: 'session-B', name: 'B' }] },
+    },
     push: async (to, text) => { calls.push({ to, text }); return { sent: 1, failed: 0, targets: [to] } },
   }
 
