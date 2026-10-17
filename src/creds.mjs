@@ -44,6 +44,8 @@ export function createStore(stateDir) {
   const credFile = path.join(dir, 'credentials.json')
   const sessionMapFile = path.join(dir, 'session-map.json')
   const bufFile = path.join(dir, 'updates-buf.json')
+  const seenMessagesFile = path.join(dir, 'seen-messages.json')
+  const accountSettingsFile = path.join(dir, 'account-settings.json')
 
   return {
     dir,
@@ -56,5 +58,14 @@ export function createStore(stateDir) {
       return typeof d?.buf === 'string' ? d.buf : ''
     },
     saveBuf: (buf) => saveJson(bufFile, { buf, savedAt: Date.now() }),
+    loadSeenMessages: () => {
+      const values = loadJson(seenMessagesFile, [])
+      return Array.isArray(values)
+        ? values.filter((value) => typeof value === 'string').slice(-1000)
+        : []
+    },
+    saveSeenMessages: (values) => saveJson(seenMessagesFile, values.slice(-1000)),
+    loadAccountSettings: () => loadJson(accountSettingsFile, {}),
+    saveAccountSettings: (settings) => saveJson(accountSettingsFile, settings),
   }
 }

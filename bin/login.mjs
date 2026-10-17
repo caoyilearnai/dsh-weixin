@@ -4,13 +4,21 @@
  * 手机端前置：微信「设置 → 插件 → ClawBot」（iOS ≥ 8.0.70；安卓灰度中）。
  * 凭据写入状态目录（默认 $DSH_HOME/dsh-weixin/credentials.json），插件重启后自动读取。
  *
- * 用法：node bin/login.mjs [stateDir]
+ * 用法：node bin/login.mjs [stateDir] [accountId] [accountRoot] [folder]
+ * 未提供 accountRoot/folder 时会交互询问。新账号没有文件夹不能开始绑定。
  */
 
 import readline from 'node:readline'
 import qrcode from 'qrcode-generator'
 import * as ilink from '../src/ilink.mjs'
-import { createStore, resolveStateDir } from '../src/creds.mjs'
+import { resolveStateDir } from '../src/creds.mjs'
+import {
+  DEFAULT_ACCOUNT_ID,
+  assertAccountId,
+  assertFolderName,
+  createAccountStore,
+  ensureAccountWorkspace,
+} from '../src/accounts.mjs'
 
 const LOGIN_TIMEOUT_MS = 5 * 60_000
 const MAX_QR_REFRESH = 3
@@ -46,10 +54,23 @@ function renderQr(text) {
 
 async function main() {
   const stateDir = resolveStateDir(process.argv[2] ?? '')
-  const store = createStore(stateDir)
+  const accountId = assertAccountId(process.argv[3] ?? DEFAULT_ACCOUNT_ID)
+  const store = createAccountStore(stateDir, accountId, { migrateLegacy: true })
   const existing = store.loadCredentials()
+  const saved = store.loadAccountSettings?.() ?? {}
+  let accountRoot = String(
+    process.argv[4] || process.env.DSH_WEIXIN_ACCOUNT_ROOT || saved.accountRoot || '',
+  ).trim()
+  let folder = String(process.argv[5] || saved.folder || '').trim()
+  console.log(`\n🔑 dsh-weixin 登录（账号 ${accountId}，状态目录 ${store.dir}）`)
+  if (!accountRoot) accountRoot = await readLineFromStdin('请输入账号目录根 accountRoot：')
+  if (!folder) folder = await readLineFromStdin('请输入本账号的单段文件夹名：')
+  folder = assertFolderName(folder)
+  const cwd = ensureAccountWorkspace(accountRoot, folder)
+  store.saveAccountSettings?.({ accountRoot, folder, updatedAt: Date.now() })
+
   const localTokenList = existing?.bot_token ? [existing.bot_token] : []
-  console.log(`\n🔑 正在向腾讯 iLink 服务器申请登录二维码（状态目录 ${store.dir}）…`)
+  console.log(`\n🔑 正在向腾讯 iLink 服务器申请登录二维码（账号 ${accountId}，目录 ${cwd}）…`)
 
   let apiBaseUrl = ilink.DEFAULT_BASE_URL
   let qr = await ilink.fetchQRCode({ localTokenList })

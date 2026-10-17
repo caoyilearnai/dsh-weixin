@@ -25,7 +25,11 @@ test('bin/login.mjs 导入可用且能启动（无 MODULE_NOT_FOUND）', async (
   const stateDir = await mkdtemp(join(tmpdir(), 'dsh-weixin-bin-'))
 
   const run = await new Promise((resolve) => {
-    const child = spawn(process.execPath, [BIN, stateDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(
+      process.execPath,
+      [BIN, stateDir, 'default', stateDir, 'alice'],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    )
     let out = ''
     const timer = setTimeout(() => {
       child.kill('SIGKILL')
@@ -41,6 +45,7 @@ test('bin/login.mjs 导入可用且能启动（无 MODULE_NOT_FOUND）', async (
     assert.doesNotMatch(run.out, /ERR_MODULE_NOT_FOUND|Cannot find module/, `输出里出现了模块解析错误：\n${run.out}`)
     // 证明导入成功、main() 真正启动（此句在 main 内、网络请求之前打印）
     assert.match(run.out, /正在向腾讯 iLink 服务器申请登录二维码/, `未看到 main() 启动提示：\n${run.out}`)
+    assert.match(run.out, /目录 .*alice/, `未使用命令行传入的账号文件夹：\n${run.out}`)
   } finally {
     await rm(stateDir, { recursive: true, force: true }) // 清理临时状态目录
   }

@@ -16,10 +16,11 @@ const LONG_POLL_TIMEOUT_MS = 35_000
 const API_TIMEOUT_MS = 15_000
 
 export class ILinkError extends Error {
-  constructor(message, { ret, errmsg } = {}) {
+  constructor(message, { ret, errcode, errmsg } = {}) {
     super(message)
     this.name = 'ILinkError'
     this.ret = ret
+    this.errcode = errcode
     this.errmsg = errmsg
   }
 }
@@ -127,8 +128,11 @@ export async function pollQRStatus({ baseUrl = DEFAULT_BASE_URL, qrcode, verifyC
 
 /* ------------------------------ 消息 ------------------------------ */
 
-export async function getUpdates({ baseUrl, token, buf = '', timeoutMs = LONG_POLL_TIMEOUT_MS, botAgent, signal }) {
-  return apiPost({
+export async function getUpdates({
+  baseUrl, token, buf = '', timeoutMs = LONG_POLL_TIMEOUT_MS, botAgent, signal,
+  post = apiPost,
+}) {
+  const resp = await post({
     baseUrl,
     endpoint: 'ilink/bot/getupdates',
     token,
@@ -136,6 +140,17 @@ export async function getUpdates({ baseUrl, token, buf = '', timeoutMs = LONG_PO
     signal,
     body: { get_updates_buf: buf, base_info: buildBaseInfo(botAgent) },
   })
+  const ret = Number(resp?.ret ?? 0)
+  const errcode = Number(resp?.errcode ?? resp?.err_code ?? 0)
+  if (ret !== 0 || errcode !== 0) {
+    const errmsg = resp?.errmsg ?? resp?.err_msg ?? ''
+    throw new ILinkError(`getupdates ret=${ret} errcode=${errcode} errmsg=${errmsg}`, {
+      ret,
+      errcode,
+      errmsg,
+    })
+  }
+  return resp
 }
 
 /** 发送文本消息；带限流（ret=-2）指数退避重试。post/backoffBaseMs 为测试注入点（review S10）。 */
@@ -318,6 +333,7 @@ export function normalizeInboundMessages(resp) {
 
     if (from && (texts.length > 0 || voiceTexts.length > 0 || nonTextTypes.length > 0)) {
       out.push({
+        messageId: String(raw?.message_id ?? raw?.msg_id ?? ''),
         from, to, contextToken,
         text: texts.join('\n'),
         voiceText: voiceTexts.join('\n'),

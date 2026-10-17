@@ -5,7 +5,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { sendMessage, ILinkError } from '../src/ilink.mjs'
+import { getUpdates, sendMessage, ILinkError } from '../src/ilink.mjs'
 
 const BASE = { baseUrl: 'https://example.invalid', token: 't', to: 'u@im.wechat', text: 'hi' }
 
@@ -36,4 +36,28 @@ test('sendMessage 网络错误重试至耗尽后抛出（review S10）', async (
     /fetch failed/,
   )
   assert.equal(calls, 2)
+})
+
+test('getUpdates surfaces ret=-14 as a typed business error', async () => {
+  const post = async () => ({ ret: -14, errmsg: 'session expired' })
+  await assert.rejects(
+    () => getUpdates({
+      baseUrl: BASE.baseUrl,
+      token: BASE.token,
+      post,
+    }),
+    (err) => err instanceof ILinkError && err.ret === -14,
+  )
+})
+
+test('getUpdates treats a non-zero errcode as a business error', async () => {
+  const post = async () => ({ ret: 0, errcode: -14, errmsg: 'session expired' })
+  await assert.rejects(
+    () => getUpdates({
+      baseUrl: BASE.baseUrl,
+      token: BASE.token,
+      post,
+    }),
+    (err) => err instanceof ILinkError && err.errcode === -14,
+  )
 })
